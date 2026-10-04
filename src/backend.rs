@@ -149,7 +149,6 @@ impl Backend for SshBackend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        // Cannot query the cursor over SSH without a round-trip.
         Ok(Position::ORIGIN)
     }
 

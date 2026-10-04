@@ -1,30 +1,67 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use ratatui::Terminal;
 use russh::{
     Channel, ChannelId, MethodKind, MethodSet, Pty,
-    keys::PublicKey,
+    keys::{
+        Algorithm, HashAlg, PrivateKey, PublicKey,
+        ssh_key::{LineEnding, rand_core::OsRng},
+    },
     server::{Auth, Config, Handle, Handler, Msg, Server, Session},
 };
 use termwiz::input::{InputEvent, InputParser, KeyCode, KeyEvent, Modifiers};
 use tokio::{net::ToSocketAddrs, sync::mpsc};
 
 use crate::{
-    app::{App, Identity},
+    app::App,
     backend::SshBackend,
+    state::{AppState, User},
 };
 
-pub type Authorizer = Arc<dyn Fn(&str, &PublicKey) -> bool + Send + Sync>;
-pub type AppFactory = Arc<dyn Fn(&Identity) -> Box<dyn App> + Send + Sync>;
+pub type AppFactory = fn(AppState, &'static User) -> Box<dyn App>;
 
 const ENTER_ALT_SCREEN: &str = "\x1b[?1049h\x1b[H\x1b[?25l";
 const LEAVE_ALT_SCREEN: &str = "\x1b[?1049l\x1b[?25h\x1b[0m";
 
 pub struct SshServer {
-    pub authorize: Authorizer,
+    pub state: AppState,
     pub factory: AppFactory,
     pub refresh_rate: Option<Duration>,
+}
+
+pub fn config(host_key: PrivateKey) -> Config {
+    let mut methods = MethodSet::empty();
+    methods.push(MethodKind::PublicKey);
+
+    Config {
+        keys: vec![host_key],
+        methods,
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        ..Default::default()
+    }
+}
+
+pub fn load_or_create_host_key(path: &Path) -> Result<PrivateKey> {
+    if path.exists() {
+        return PrivateKey::read_openssh_file(path)
+            .with_context(|| format!("reading host key {}", path.display()));
+    }
+
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("creating host key directory {}", dir.display()))?;
+    }
+
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    key.write_openssh_file(path, LineEnding::LF)
+        .with_context(|| format!("writing host key {}", path.display()))?;
+
+    println!("generated new host key at {}", path.display());
+
+    Ok(key)
 }
 
 impl SshServer {
@@ -40,11 +77,11 @@ impl Server for SshServer {
 
     fn new_client(&mut self, peer: Option<SocketAddr>) -> SessionHandler {
         SessionHandler {
-            authorize: self.authorize.clone(),
-            factory: self.factory.clone(),
+            state: self.state,
+            factory: self.factory,
             refresh_rate: self.refresh_rate,
             peer,
-            identity: None,
+            user: None,
             app: None,
             size: (80, 24),
             events: None,
@@ -60,11 +97,11 @@ enum Event {
 }
 
 pub struct SessionHandler {
-    authorize: Authorizer,
+    state: AppState,
     factory: AppFactory,
     refresh_rate: Option<Duration>,
     peer: Option<SocketAddr>,
-    identity: Option<Identity>,
+    user: Option<&'static User>,
     app: Option<Box<dyn App>>,
     size: (u16, u16),
     events: Option<mpsc::UnboundedSender<Event>>,
@@ -76,6 +113,25 @@ impl SessionHandler {
         if let Some(tx) = &self.events {
             let _ = tx.send(event);
         }
+    }
+
+    fn peer(&self) -> String {
+        self.peer.map_or_else(|| "?".into(), |p| p.to_string())
+    }
+
+    fn lookup(&self, key: &PublicKey) -> Option<&'static User> {
+        let user = self.state.user_by_key(key);
+
+        if user.is_none() {
+            println!(
+                "rejected key from {}: {} {}",
+                self.peer(),
+                key.fingerprint(HashAlg::Sha256),
+                key.to_openssh().unwrap_or_default()
+            );
+        }
+
+        user
     }
 
     fn reject_try_publickey() -> Auth {
@@ -99,34 +155,29 @@ impl Handler for SessionHandler {
         Ok(Self::reject_try_publickey())
     }
 
-    async fn auth_publickey_offered(&mut self, user: &str, key: &PublicKey) -> Result<Auth> {
-        Ok(if (self.authorize)(user, key) {
-            Auth::Accept
-        } else {
-            Auth::reject()
+    async fn auth_publickey_offered(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
+        Ok(match self.lookup(key) {
+            Some(_) => Auth::Accept,
+            None => Self::reject_try_publickey(),
         })
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth> {
-        if !(self.authorize)(user, key) {
-            return Ok(Auth::reject());
-        }
-        self.identity = Some(Identity::new(user, key));
+    async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
+        let Some(user) = self.lookup(key) else {
+            return Ok(Self::reject_try_publickey());
+        };
+        self.user = Some(user);
         Ok(Auth::Accept)
     }
 
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<()> {
-        let identity = self
-            .identity
-            .as_ref()
+        let user = self
+            .user
             .ok_or_else(|| anyhow!("auth succeeded without a public key"))?;
-        println!(
-            "connected: {}@{} ({})",
-            identity.user,
-            self.peer.map_or("?".into(), |p| p.to_string()),
-            identity.fingerprint
-        );
-        self.app = Some((self.factory)(identity));
+
+        println!("connected: {} from {}", user.name, self.peer());
+
+        self.app = Some((self.factory)(self.state, user));
         Ok(())
     }
 
@@ -218,8 +269,8 @@ impl Handler for SessionHandler {
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
-        if let Some(identity) = &self.identity {
-            println!("disconnected: {} ({})", identity.user, identity.fingerprint);
+        if let Some(user) = self.user {
+            println!("disconnected: {} from {}", user.name, self.peer());
         }
     }
 }

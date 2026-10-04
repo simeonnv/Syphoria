@@ -1,0 +1,22 @@
+domains = ["cool.com", "awesome.com"]
+
+[server]
+listen = "0.0.0.0:2222"
+host_key = "/var/lib/syphoria/host_ed25519"
+
+[stalwart]
+url = "http://localhost:8080"
+admin_user = "admin"
+admin_password_file = ".devenv/state/stalwart/admin-password"
+
+[users.alice]
+ssh_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy0V3T7hXYcCnRPYmD+pwWhb2WkGZJiV3dU8pKkUcZx alice@laptop",
+]
+domains = ["cool.com", "awesome.com"]
+
+[users.bob]
+ssh_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFm9H4u1gYp8lYgFzR2l4Y7l1xJm6sS8b3Gx2r0P9QfW bob@desktop",
+]
+domains = ["awesome.com"]

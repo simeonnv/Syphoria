@@ -4,14 +4,23 @@ use futures::FutureExt;
 use tokio::task::JoinHandle;
 
 pub enum Task<T> {
+    Unexecuted,
     Running(JoinHandle<T>),
     Done(T),
     Panicked,
 }
 
 impl<T: Send + 'static> Task<T> {
-    pub fn spawn(future: impl Future<Output = T> + Send + 'static) -> Self {
+    pub fn new() -> Self {
+        Self::Unexecuted
+    }
+
+    pub fn new_spawn(future: impl Future<Output = T> + Send + 'static) -> Self {
         Task::Running(tokio::spawn(future))
+    }
+
+    pub fn spawn(&mut self, future: impl Future<Output = T> + Send + 'static) {
+        *self = Task::Running(tokio::spawn(future))
     }
 
     pub fn poll(&mut self) -> &Self {
@@ -24,6 +33,12 @@ impl<T: Send + 'static> Task<T> {
             };
         }
         self
+    }
+}
+
+impl<T: Send + 'static> Default for Task<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
