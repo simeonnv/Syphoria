@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use exn::{Exn, ResultExt, bail, ensure};
+use exn::{Exn, IteratorExt, OptionExt, ResultExt, bail, ensure};
 use rusqlite::{Connection, ErrorCode, params};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -66,14 +66,20 @@ pub struct Db {
 
 impl Vault {
     pub fn new(config: VaultConfig) -> exn::Result<Self, VaultError> {
-        let err = || {
+        let dir = &config.dir;
+        fs::create_dir_all(dir).or_raise(|| {
             VaultError(format!(
-                "failed to prepare vault directory {}",
-                config.dir.display()
+                "failed to create vault directory {}",
+                dir.display()
             ))
-        };
-        fs::create_dir_all(&config.dir).or_raise(err)?;
-        fs::set_permissions(&config.dir, Permissions::from_mode(0o700)).or_raise(err)?;
+        })?;
+        fs::set_permissions(dir, Permissions::from_mode(0o700)).or_raise(|| {
+            VaultError(format!(
+                "failed to restrict permissions of {}",
+                dir.display()
+            ))
+        })?;
+
         Ok(Self {
             dir: config.dir,
             failures: Mutex::default(),
@@ -89,21 +95,35 @@ impl Vault {
         user: &'static User,
         password: Zeroizing<String>,
     ) -> exn::Result<Db, VaultError> {
-        let err = || VaultError(format!("failed to create vault of `{}`", user.name));
         let path = self.path(user);
+
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)
-            .or_raise(err)?;
+            .or_raise(|| VaultError(format!("failed to create vault file {}", path.display())))?;
+
         let target = path.clone();
-        let conn = blocking(err, move || open(&target, &password))
-            .await
-            .inspect_err(|_| {
-                let _ = fs::remove_file(&path);
-            })?;
-        Ok(Db::new(conn, user))
+        let opened = blocking(move || {
+            open(&target, &password)?
+                .ok_or_raise(|| VaultError("new vault rejected its own key".into()))
+        })
+        .await;
+
+        match opened {
+            Ok(conn) => Ok(Db::new(conn, user)),
+            Err(e) => match fs::remove_file(&path) {
+                Ok(()) => Err(e),
+                Err(removal) => {
+                    let causes: [Exn; 2] = [e.into(), removal.into()];
+                    Err(causes.into_iter().raise(VaultError(format!(
+                        "vault setup failed and {} could not be removed",
+                        path.display()
+                    ))))
+                }
+            },
+        }
     }
 
     pub async fn unlock(
@@ -126,14 +146,7 @@ impl Vault {
             path.exists(),
             VaultError(format!("vault of `{}` does not exist", user.name))
         );
-        let opened = blocking(
-            || VaultError(format!("failed to unlock vault of `{}`", user.name)),
-            move || match open(&path, &password) {
-                Err(e) if e.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Ok(None),
-                result => result.map(Some),
-            },
-        )
-        .await?;
+        let opened = blocking(move || open(&path, &password)).await?;
 
         if let Some(conn) = opened {
             self.failures().remove(&user.name);
@@ -180,43 +193,44 @@ impl Db {
 
     pub async fn accounts(&self) -> exn::Result<Vec<Account>, VaultError> {
         let conn = self.conn.clone();
-        blocking(
-            || VaultError("failed to list accounts".into()),
-            move || {
-                let conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
-                let mut statement = conn.prepare(
+        blocking(move || {
+            let conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut statement = conn
+                .prepare(
                     "SELECT id, address, service, username, password, url, notes
                      FROM accounts ORDER BY service, username",
-                )?;
-                statement
-                    .query_map([], |row| {
-                        Ok(Account {
-                            id: row.get(0)?,
-                            address: row.get(1)?,
-                            service: row.get(2)?,
-                            username: row.get(3)?,
-                            password: row.get(4)?,
-                            url: row.get(5)?,
-                            notes: row.get(6)?,
-                        })
-                    })?
-                    .collect()
-            },
-        )
+                )
+                .or_raise(|| VaultError("failed to prepare account query".into()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(Account {
+                        id: row.get(0)?,
+                        address: row.get(1)?,
+                        service: row.get(2)?,
+                        username: row.get(3)?,
+                        password: row.get(4)?,
+                        url: row.get(5)?,
+                        notes: row.get(6)?,
+                    })
+                })
+                .or_raise(|| VaultError("failed to query accounts".into()))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .or_raise(|| VaultError("failed to read account row".into()))
+        })
         .await
     }
 
     pub async fn save(&self, account: Account) -> exn::Result<(), VaultError> {
-        let err = || VaultError(format!("failed to save account `{}`", account.service));
         ensure!(
             !account.service.trim().is_empty(),
             VaultError("service may not be empty".into())
         );
-        Address::new(self.user, &account.address).or_raise(err)?;
+        Address::new(self.user, &account.address)
+            .or_raise(|| VaultError("invalid account address".into()))?;
 
         let conn = self.conn.clone();
         let saved = account.clone();
-        blocking(err, move || {
+        blocking(move || {
             let conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
             let values = params![
                 saved.address,
@@ -228,16 +242,20 @@ impl Db {
                 saved.id
             ];
             match saved.id {
-                Some(_) => conn.execute(
-                    "UPDATE accounts SET address = ?1, service = ?2, username = ?3,
-                     password = ?4, url = ?5, notes = ?6 WHERE id = ?7",
-                    values,
-                ),
-                None => conn.execute(
-                    "INSERT INTO accounts (address, service, username, password, url, notes)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    &values[..6],
-                ),
+                Some(id) => conn
+                    .execute(
+                        "UPDATE accounts SET address = ?1, service = ?2, username = ?3,
+                         password = ?4, url = ?5, notes = ?6 WHERE id = ?7",
+                        values,
+                    )
+                    .or_raise(|| VaultError(format!("failed to update account {id}"))),
+                None => conn
+                    .execute(
+                        "INSERT INTO accounts (address, service, username, password, url, notes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        &values[..6],
+                    )
+                    .or_raise(|| VaultError("failed to insert account".into())),
             }
         })
         .await?;
@@ -247,33 +265,37 @@ impl Db {
     pub async fn delete(&self, account: &Account) -> exn::Result<(), VaultError> {
         let conn = self.conn.clone();
         let id = account.id;
-        blocking(
-            || VaultError(format!("failed to delete account `{}`", account.service)),
-            move || {
-                let conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
-                conn.execute("DELETE FROM accounts WHERE id = ?1", [id])
-            },
-        )
+        let service = account.service.clone();
+        blocking(move || {
+            let conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
+            conn.execute("DELETE FROM accounts WHERE id = ?1", [id])
+                .or_raise(|| VaultError(format!("failed to delete account `{service}`")))
+        })
         .await?;
         Ok(())
     }
 }
 
-fn open(path: &Path, password: &str) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.pragma_update(None, "key", password)?;
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
-    conn.pragma_update(None, "cipher_memory_security", "ON")?;
-    conn.execute_batch(SCHEMA)?;
-    Ok(conn)
+fn open(path: &Path, password: &str) -> exn::Result<Option<Connection>, VaultError> {
+    let conn = Connection::open(path)
+        .or_raise(|| VaultError(format!("failed to open database {}", path.display())))?;
+    conn.pragma_update(None, "key", password)
+        .or_raise(|| VaultError("failed to set database key".into()))?;
+    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())) {
+        Err(e) if e.sqlite_error_code() == Some(ErrorCode::NotADatabase) => return Ok(None),
+        result => result.or_raise(|| VaultError("failed to read database".into()))?,
+    }
+    conn.pragma_update(None, "cipher_memory_security", "ON")
+        .or_raise(|| VaultError("failed to enable cipher memory security".into()))?;
+    conn.execute_batch(SCHEMA)
+        .or_raise(|| VaultError("failed to apply schema".into()))?;
+    Ok(Some(conn))
 }
 
 async fn blocking<T: Send + 'static>(
-    err: impl FnOnce() -> VaultError,
-    f: impl FnOnce() -> rusqlite::Result<T> + Send + 'static,
+    f: impl FnOnce() -> exn::Result<T, VaultError> + Send + 'static,
 ) -> exn::Result<T, VaultError> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result.or_raise(err),
-        Err(e) => Err(Exn::new(e).raise(err())),
-    }
+    tokio::task::spawn_blocking(f)
+        .await
+        .or_raise(|| VaultError("vault task failed".into()))?
 }

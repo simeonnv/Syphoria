@@ -343,7 +343,7 @@ impl View for Accounts {
         let State::Locked { attempt, error, .. } = &mut self.state else {
             return Action::None;
         };
-        if !matches!(attempt.poll(), Task::Done(_) | Task::Panicked) {
+        if !matches!(attempt.poll(), Task::Done(_) | Task::Panicked(_)) {
             return Action::None;
         }
         match mem::take(attempt) {
@@ -355,10 +355,11 @@ impl View for Accounts {
                 *error = Some(e);
                 Action::None
             }
-            _ => {
-                *error = Some(anyhow!("vault task panicked"));
+            Task::Panicked(e) => {
+                *error = Some(e.into());
                 Action::None
             }
+            Task::Unexecuted | Task::Running(_) => Action::None,
         }
     }
 
@@ -639,7 +640,7 @@ impl View for AccountForm {
             Task::Unexecuted | Task::Done(Ok(())) => Line::from(""),
             Task::Running(_) => Line::from("saving…").dim(),
             Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
-            Task::Panicked => Line::from("save task panicked").red(),
+            Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         };
         frame.render_widget(line, status);
     }

@@ -27,11 +27,23 @@ pub struct AddressError(String);
 #[serde(tag = "error", rename_all = "camelCase")]
 enum ApiError {
     #[serde(skip)]
-    #[error(transparent)]
-    Url(url::ParseError),
+    #[error("invalid api path `{path}`")]
+    Url {
+        path: String,
+        source: url::ParseError,
+    },
     #[serde(skip)]
-    #[error(transparent)]
-    Http(reqwest::Error),
+    #[error("failed to send request")]
+    Send(#[source] reqwest::Error),
+    #[serde(skip)]
+    #[error("stalwart responded {status}, failed to read body")]
+    Body {
+        status: StatusCode,
+        source: reqwest::Error,
+    },
+    #[serde(skip)]
+    #[error("failed to decode response")]
+    Decode(#[source] reqwest::Error),
     #[serde(skip)]
     #[error("stalwart responded {status}: {body}")]
     Status { status: StatusCode, body: String },
@@ -208,7 +220,10 @@ impl Stalwart {
         path: &str,
         body: Option<Value>,
     ) -> exn::Result<T, ApiError> {
-        let url = self.url.join(path).map_err(ApiError::Url)?;
+        let url = self.url.join(path).map_err(|source| ApiError::Url {
+            path: path.to_owned(),
+            source,
+        })?;
         let mut request = self
             .http
             .request(method, url)
@@ -217,14 +232,17 @@ impl Stalwart {
             request = request.json(&body);
         }
 
-        let response = request.send().await.map_err(ApiError::Http)?;
+        let response = request.send().await.map_err(ApiError::Send)?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.map_err(ApiError::Http)?;
+            let body = response
+                .text()
+                .await
+                .map_err(|source| ApiError::Body { status, source })?;
             bail!(ApiError::Status { status, body });
         }
 
-        match response.json().await.map_err(ApiError::Http)? {
+        match response.json().await.map_err(ApiError::Decode)? {
             Reply::Data { data } => Ok(data),
             Reply::Error(e) => bail!(e),
         }

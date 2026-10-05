@@ -60,13 +60,12 @@ pub struct Message {
 
 impl Mail {
     pub async fn connect(url: &Url, login: &str, password: &str) -> Result<Self, MailError> {
-        let err = || MailError(format!("failed to open mailbox of `{login}` at {url}"));
         let client = Client::new()
             .credentials((login, password))
             .follow_redirects(url.host_str())
             .connect(url.as_str().trim_end_matches('/'))
             .await
-            .or_raise(err)?;
+            .or_raise(|| MailError(format!("failed to connect to {url} as `{login}`")))?;
 
         let mut mail = Self {
             client,
@@ -75,7 +74,7 @@ impl Mail {
             mailboxes: Vec::new(),
         };
 
-        let folders = mail.folders().await.or_raise(err)?;
+        let folders = mail.folders().await?;
 
         let find = |role: Role| {
             folders
@@ -83,7 +82,6 @@ impl Mail {
                 .find(|f| f.role == role)
                 .map(|f| f.id.clone())
                 .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))
-                .or_raise(err)
         };
         mail.inbox = find(Role::Inbox)?;
         mail.sent = find(Role::Sent)?;
@@ -96,18 +94,16 @@ impl Mail {
     }
 
     pub async fn move_to(&self, id: &str, role: Role) -> Result<(), MailError> {
-        let err = || MailError(format!("failed to move email `{id}` to {role:?}"));
         let mailbox = self
             .mailboxes
             .iter()
             .find(|(r, _)| *r == role)
             .map(|(_, mailbox)| mailbox.as_str())
-            .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))
-            .or_raise(err)?;
+            .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))?;
         self.client
             .email_set_mailboxes(id, [mailbox])
             .await
-            .or_raise(err)?;
+            .or_raise(|| MailError(format!("failed to move email `{id}` to {role:?}")))?;
         Ok(())
     }
 
@@ -156,7 +152,6 @@ impl Mail {
     }
 
     pub async fn summaries(&self, mailbox: &str) -> Result<Vec<Summary>, MailError> {
-        let err = || MailError(format!("failed to list emails in mailbox `{mailbox}`"));
         let mut request = self.client.build();
         let query = request
             .query_email()
@@ -177,13 +172,12 @@ impl Mail {
         let list = request
             .send()
             .await
-            .or_raise(err)?
+            .or_raise(|| MailError(format!("failed to query emails in mailbox `{mailbox}`")))?
             .unwrap_method_responses()
             .pop()
-            .ok_or_raise(|| MailError("server returned no Email/get response".into()))
-            .or_raise(err)?
+            .ok_or_raise(|| MailError("server returned no Email/get response".into()))?
             .unwrap_get_email()
-            .or_raise(err)?
+            .or_raise(|| MailError("Email/get failed".into()))?
             .take_list();
 
         Ok(list
@@ -200,7 +194,6 @@ impl Mail {
     }
 
     pub async fn message(&self, id: &str) -> Result<Message, MailError> {
-        let err = || MailError(format!("failed to load email `{id}`"));
         let mut request = self.client.build();
         request
             .get_email()
@@ -221,11 +214,10 @@ impl Mail {
         let email = request
             .send_get_email()
             .await
-            .or_raise(err)?
+            .or_raise(|| MailError(format!("failed to fetch email `{id}`")))?
             .take_list()
             .pop()
-            .ok_or_raise(|| MailError("no such email".into()))
-            .or_raise(err)?;
+            .ok_or_raise(|| MailError(format!("email `{id}` not found")))?;
 
         let body = email
             .text_body()
@@ -259,8 +251,7 @@ impl Mail {
         subject: &str,
         body: &str,
     ) -> Result<(), MailError> {
-        let err = || MailError(format!("failed to send email from `{from}`"));
-        let identity = self.identity(name, from).await.or_raise(err)?;
+        let identity = self.identity(name, from).await?;
 
         let mut request = self.client.build();
         let email = request
@@ -280,33 +271,31 @@ impl Mail {
 
         let create_id = email
             .create_id()
-            .ok_or_raise(|| MailError("email has no create id".into()))
-            .or_raise(err)?;
+            .ok_or_raise(|| MailError("email has no create id".into()))?;
 
         let email_id = request
             .send_single::<EmailSetResponse>()
             .await
-            .or_raise(err)?
+            .or_raise(|| MailError("failed to create email".into()))?
             .created(&create_id)
-            .or_raise(err)?
+            .or_raise(|| MailError("server did not create email".into()))?
             .take_id();
 
         self.client
-            .email_submission_create(email_id, identity)
+            .email_submission_create(email_id.as_str(), identity)
             .await
-            .or_raise(err)?;
+            .or_raise(|| MailError(format!("failed to submit email `{email_id}`")))?;
         Ok(())
     }
 
     async fn identity(&self, name: &str, email: &str) -> Result<String, MailError> {
-        let err = || MailError(format!("failed to find a sending identity for `{email}`"));
         let mut request = self.client.build();
         request.get_identity();
 
         let existing = request
             .send_get_identity()
             .await
-            .or_raise(err)?
+            .or_raise(|| MailError("failed to list identities".into()))?
             .take_list()
             .into_iter()
             .find(|i| i.email() == Some(email));
@@ -317,7 +306,7 @@ impl Mail {
                 .client
                 .identity_create(name, email)
                 .await
-                .or_raise(err)?,
+                .or_raise(|| MailError(format!("failed to create identity for `{email}`")))?,
         };
         Ok(identity.take_id())
     }

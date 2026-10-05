@@ -733,7 +733,7 @@ fn status<T>(frame: &mut Frame, area: Rect, task: &Load<T>) {
     let line = match task {
         Task::Done(Ok(_)) | Task::Unexecuted => return,
         Task::Running(_) => Line::from("loading…").dim(),
-        Task::Panicked => Line::from("task panicked").red(),
+        Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
     };
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);

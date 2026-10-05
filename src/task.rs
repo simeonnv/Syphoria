@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use futures::FutureExt;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 pub struct Handle<T>(JoinHandle<T>);
 
@@ -15,7 +15,7 @@ pub enum Task<T> {
     Unexecuted,
     Running(Handle<T>),
     Done(T),
-    Panicked,
+    Panicked(JoinError),
 }
 
 impl<T: Send + 'static> Task<T> {
@@ -37,7 +37,7 @@ impl<T: Send + 'static> Task<T> {
         {
             *self = match result {
                 Ok(value) => Task::Done(value),
-                Err(_) => Task::Panicked,
+                Err(e) => Task::Panicked(e),
             };
         }
         self

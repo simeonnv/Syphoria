@@ -194,7 +194,7 @@ impl View for Compose {
             Task::Running(_) => Line::from("sending…").dim(),
             Task::Done(Ok(())) => Line::from("sent ✓").green(),
             Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
-            Task::Panicked => Line::from("send task panicked").red(),
+            Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         };
         frame.render_widget(line, status);
     }

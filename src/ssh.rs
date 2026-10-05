@@ -127,7 +127,8 @@ impl SessionHandler {
                 "rejected key from {}: {} {}",
                 self.peer(),
                 key.fingerprint(HashAlg::Sha256),
-                key.to_openssh().unwrap_or_default()
+                key.to_openssh()
+                    .unwrap_or_else(|e| format!("(failed to encode key: {e})"))
             );
         }
 

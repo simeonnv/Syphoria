@@ -31,6 +31,11 @@
 
 - Modules: `exn::Result<T, ModError>`, `ModError` = thiserror struct describing what this layer does.
 - Add context per boundary with `or_raise(|| ...)` / `ok_or_raise`, `bail!`/`ensure!` for new errors. Never flatten into strings.
+- Context names what failed at that call, not what the function does; callers add that. No shared `let err = || ...` closures.
+- Don't re-wrap errors that already carry context from the same layer (`.ok_or_raise(..).or_raise(err)`).
+- Never drop errors (`let _ =`, `.ok()`, `map_err(|_| ..)`, `Err(_) =>`). Propagate; if cleanup also fails keep both as children (`IteratorExt::raise`). Exception: non-fatal teardown (closing channels).
+- Helpers return `exn::Result` with per-step context; don't `?`-flatten several foreign calls under one context.
+- Print with `{e:#}`.
 - Top level (main, config, ui) uses `anyhow`; convert with `exn_anyhow::into_anyhow`, print with `{e:#}`.
 - Match API errors before raising (e.g. `Reply::Error(ApiError::FieldAlreadyExists)`), don't downcast.
 
