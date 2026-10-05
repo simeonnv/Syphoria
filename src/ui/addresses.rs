@@ -1,4 +1,5 @@
 use exn_anyhow::into_anyhow;
+use rand::{RngExt, distr::Alphanumeric};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -12,7 +13,7 @@ use termwiz::input::Modifiers;
 use super::{Action, Ctx, Load, View, line_input, status};
 use crate::{
     app::{KeyCode, KeyEvent},
-    stalwart::Stalwart,
+    stalwart::Address,
     state::User,
     task::Task,
 };
@@ -23,7 +24,7 @@ enum Mode {
         local: Box<TextArea<'static>>,
         domain: usize,
     },
-    Delete(String),
+    Delete(Address),
 }
 
 pub struct Addresses {
@@ -31,6 +32,7 @@ pub struct Addresses {
     list: Load<Vec<String>>,
     selected: ListState,
     mode: Mode,
+    error: Option<anyhow::Error>,
 }
 
 impl Addresses {
@@ -40,6 +42,7 @@ impl Addresses {
             list: Task::new(),
             selected: ListState::default().with_selected(Some(0)),
             mode: Mode::Browse,
+            error: None,
         };
         page.reload(ctx);
         page
@@ -80,7 +83,16 @@ impl View for Addresses {
         }
 
         match &mut self.mode {
-            Mode::Browse => {}
+            Mode::Browse => {
+                if let Some(error) = &self.error {
+                    frame.render_widget(
+                        Paragraph::new(format!("error: {error:#}"))
+                            .red()
+                            .block(Block::bordered()),
+                        prompt,
+                    );
+                }
+            }
             Mode::Delete(address) => frame.render_widget(
                 Paragraph::new(format!("delete {address}? y/n"))
                     .red()
@@ -100,11 +112,13 @@ impl View for Addresses {
                     Constraint::Length(suffix.len() as u16 + 2),
                 ])
                 .areas(prompt);
-                local.set_block(
-                    Block::bordered()
-                        .title(" new address ")
-                        .border_style(Style::new().yellow()),
-                );
+                let block = Block::bordered().title(" new address ");
+                local.set_block(match &self.error {
+                    Some(error) => block
+                        .title_bottom(Line::from(format!(" {error:#} ")).red())
+                        .border_style(Style::new().red()),
+                    None => block.border_style(Style::new().yellow()),
+                });
                 frame.render_widget(&**local, left);
                 frame.render_widget(
                     Paragraph::new(suffix).block(Block::bordered().title(" tab ")),
@@ -115,6 +129,7 @@ impl View for Addresses {
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
+        self.error = None;
         match &mut self.mode {
             Mode::Browse => match key.key {
                 KeyCode::Char('j') | KeyCode::DownArrow => self.selected.select_next(),
@@ -122,13 +137,16 @@ impl View for Addresses {
                 KeyCode::Char('r') => self.reload(ctx),
                 KeyCode::Char('n') if !ctx.user.domains.is_empty() => {
                     self.mode = Mode::Create {
-                        local: line_input(Stalwart::random_local_part()),
+                        local: line_input(random_local_part()),
                         domain: 0,
                     };
                 }
                 KeyCode::Char('d') => {
                     if let Some(address) = self.selected() {
-                        self.mode = Mode::Delete(address);
+                        match Address::new(ctx.user, &address) {
+                            Ok(address) => self.mode = Mode::Delete(address),
+                            Err(e) => self.error = Some(into_anyhow(e)),
+                        }
                     }
                 }
                 KeyCode::Escape => return Action::Pop,
@@ -140,9 +158,10 @@ impl View for Addresses {
                     self.list.spawn(async move {
                         state
                             .stalwart
-                            .remove_address(user, &address)
+                            .remove_address(&address)
                             .await
-                            .map_err(into_anyhow)
+                            .map_err(into_anyhow)?;
+                        state.stalwart.addresses(user).await.map_err(into_anyhow)
                     });
                 }
                 self.mode = Mode::Browse;
@@ -157,17 +176,24 @@ impl View for Addresses {
                     KeyCode::Tab => *domain = (*domain + 1) % domains,
                     KeyCode::Enter => {
                         let (state, user) = (ctx.state, ctx.user);
-                        let local = local.lines().join("");
-                        if let Some(domain) = user.domains.iter().nth(*domain).cloned() {
-                            self.list.spawn(async move {
-                                state
-                                    .stalwart
-                                    .add_address(user, &local, &domain)
-                                    .await
-                                    .map_err(into_anyhow)
-                            });
+                        let Some(domain) = user.domains.iter().nth(*domain) else {
+                            return Action::None;
+                        };
+                        let address = format!("{}@{domain}", local.lines().join(""));
+                        match Address::new(user, &address) {
+                            Ok(address) => {
+                                self.list.spawn(async move {
+                                    state
+                                        .stalwart
+                                        .add_address(&address)
+                                        .await
+                                        .map_err(into_anyhow)?;
+                                    state.stalwart.addresses(user).await.map_err(into_anyhow)
+                                });
+                                self.mode = Mode::Browse;
+                            }
+                            Err(e) => self.error = Some(into_anyhow(e)),
                         }
-                        self.mode = Mode::Browse;
                     }
                     _ => {
                         local.input(key);
@@ -189,4 +215,12 @@ impl View for Addresses {
     fn typing(&self) -> bool {
         matches!(self.mode, Mode::Create { .. })
     }
+}
+
+fn random_local_part() -> String {
+    rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(12)
+        .map(|b| char::from(b).to_ascii_lowercase())
+        .collect()
 }

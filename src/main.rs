@@ -25,12 +25,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let path = Args::parse().config;
-    let state = AppState::new(Config::load(&path)?)
-        .with_context(|| format!("invalid config {}", path.display()))?;
+    let args = Args::parse();
+    let state = AppState::new(Config::load(&args.config)?)
+        .with_context(|| format!("invalid config {}", args.config.display()))?;
+
     println!(
         "loaded {}: {} domain(s), {} user(s), {} key(s)",
-        path.display(),
+        args.config.display(),
         state.domains.len(),
         state.users.len(),
         state.key_count()
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
         .await
         .map_err(into_anyhow)
         .context("provisioning stalwart")?;
+
     println!("provisioned stalwart");
 
     let host_key = ssh::load_or_create_host_key(&state.server.host_key)?;

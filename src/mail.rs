@@ -80,6 +80,7 @@ impl Mail {
                 .find(|f| f.role == role)
                 .map(|f| f.id.clone())
                 .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))
+                .or_raise(err)
         };
         mail.inbox = find(Role::Inbox)?;
         mail.sent = find(Role::Sent)?;
@@ -139,7 +140,8 @@ impl Mail {
             .or_raise(err)?
             .unwrap_method_responses()
             .pop()
-            .ok_or_raise(err)?
+            .ok_or_raise(|| MailError("server returned no Email/get response".into()))
+            .or_raise(err)?
             .unwrap_get_email()
             .or_raise(err)?
             .take_list();
@@ -181,7 +183,8 @@ impl Mail {
             .or_raise(err)?
             .take_list()
             .pop()
-            .ok_or_raise(err)?;
+            .ok_or_raise(|| MailError("no such email".into()))
+            .or_raise(err)?;
 
         let body = email
             .text_body()
@@ -233,7 +236,10 @@ impl Mail {
             )
             .body_value("body".into(), body);
 
-        let create_id = email.create_id().ok_or_raise(err)?;
+        let create_id = email
+            .create_id()
+            .ok_or_raise(|| MailError("email has no create id".into()))
+            .or_raise(err)?;
 
         let email_id = request
             .send_single::<EmailSetResponse>()

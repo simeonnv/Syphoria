@@ -70,6 +70,7 @@ impl AppState {
                     bail!("user `{name}`: ssh key {fp} is already assigned to user `{owner}`");
                 }
             }
+
             users.insert(
                 name.clone(),
                 User {
