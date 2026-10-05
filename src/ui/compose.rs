@@ -13,7 +13,7 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 use termwiz::input::Modifiers;
 
-use super::{Action, Ctx, Load, View, line_input};
+use super::{Action, Ctx, Load, Mode, View, ctrl, cycle, line_input, pick};
 use crate::{
     app::{KeyCode, KeyEvent},
     task::Task,
@@ -56,6 +56,7 @@ pub struct Compose {
     subject: Box<TextArea<'static>>,
     body: Box<TextArea<'static>>,
     focus: Field,
+    mode: Mode,
     sending: Load<()>,
 }
 
@@ -78,6 +79,7 @@ impl Compose {
             subject: line_input(draft.subject),
             body,
             focus,
+            mode: Mode::Normal,
             sending: Task::new(),
         }
     }
@@ -86,31 +88,13 @@ impl Compose {
         let Task::Done(Ok(list)) = &self.addresses else {
             return None;
         };
-        self.from
-            .as_ref()
-            .filter(|from| list.contains(from))
-            .or(list.first())
+        pick(list, self.from.as_ref())
     }
 
     fn cycle_sender(&mut self, forward: bool) {
-        let Task::Done(Ok(list)) = &self.addresses else {
-            return;
-        };
-        let n = list.len();
-        if n == 0 {
-            return;
+        if let Task::Done(Ok(list)) = &self.addresses {
+            self.from = cycle(list, self.from.as_ref(), forward);
         }
-        let i = self
-            .sender()
-            .and_then(|from| list.iter().position(|a| a == from))
-            .unwrap_or(0);
-        self.from = list
-            .get(if forward {
-                (i + 1) % n
-            } else {
-                (i + n - 1) % n
-            })
-            .cloned();
     }
 
     fn send(&mut self, ctx: &Ctx) {
@@ -138,6 +122,7 @@ impl Compose {
         let name = ctx.user.name.to_string();
         let subject = self.subject.lines().join(" ");
         let body = self.body.lines().join("\n");
+        self.mode = Mode::Normal;
         self.sending.spawn(async move {
             mail.send(&name, &from, &to, &subject, &body)
                 .await
@@ -166,13 +151,13 @@ impl View for Compose {
         ])
         .areas(area);
 
-        let focus = self.focus;
+        let (focus, mode) = (self.focus, self.mode);
         let block = |title: &'static str, field: Field| {
             let block = Block::bordered().title(title);
-            if field == focus {
-                block.border_style(Style::new().yellow())
-            } else {
-                block
+            match (field == focus, mode) {
+                (true, Mode::Insert) => block.border_style(Style::new().green()),
+                (true, Mode::Normal) => block.border_style(Style::new().yellow()),
+                (false, _) => block,
             }
         };
 
@@ -196,7 +181,7 @@ impl View for Compose {
             (&mut self.body, Field::Body, " Body ", body),
         ] {
             area.set_block(block(title, field));
-            area.set_cursor_style(if field == focus {
+            area.set_cursor_style(if field == focus && mode == Mode::Insert {
                 Style::new().reversed()
             } else {
                 Style::new()
@@ -215,31 +200,56 @@ impl View for Compose {
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
-        let ctrl = key.modifiers.contains(Modifiers::CTRL);
         let shift = key.modifiers.contains(Modifiers::SHIFT);
-        match key.key {
-            KeyCode::Escape => return Action::Pop,
-            KeyCode::Char('s') if ctrl => self.send(ctx),
-            KeyCode::Tab => self.focus = self.focus.step(!shift),
-            KeyCode::Enter if self.focus != Field::Body => self.focus = self.focus.step(true),
-            KeyCode::LeftArrow | KeyCode::RightArrow if self.focus == Field::From => {
+        match (self.mode, key.key) {
+            (_, KeyCode::Char('s')) if ctrl(&key) => self.send(ctx),
+            (_, KeyCode::Tab) => self.focus = self.focus.step(!shift),
+            (_, KeyCode::LeftArrow | KeyCode::RightArrow) if self.focus == Field::From => {
                 self.cycle_sender(key.key == KeyCode::RightArrow);
             }
-            _ => {
+            (Mode::Insert, KeyCode::Escape) => self.mode = Mode::Normal,
+            (Mode::Insert, KeyCode::Enter) if self.focus != Field::Body => {
+                self.focus = self.focus.step(true);
+            }
+            (Mode::Insert, _) => {
                 if let Some(area) = self.field() {
                     area.input(key);
                 }
             }
+            (Mode::Normal, KeyCode::Escape) => return Action::Pop,
+            (Mode::Normal, KeyCode::Char('i')) if self.focus != Field::From => {
+                self.mode = Mode::Insert;
+            }
+            (Mode::Normal, KeyCode::Char('j') | KeyCode::DownArrow) => {
+                self.focus = self.focus.step(true);
+            }
+            (Mode::Normal, KeyCode::Char('k') | KeyCode::UpArrow) => {
+                self.focus = self.focus.step(false);
+            }
+            (Mode::Normal, KeyCode::Char(c @ ('h' | 'l'))) if self.focus == Field::From => {
+                self.cycle_sender(c == 'l');
+            }
+            _ => {}
         }
         Action::None
     }
 
     fn help(&self) -> &'static str {
-        "tab next field · ←/→ sender · ctrl-s send · esc back"
+        match self.mode {
+            Mode::Normal => "i insert · j/k field · h/l sender · ctrl-s or :w send · esc back",
+            Mode::Insert => "esc normal · tab field · ←/→ sender · ctrl-s send",
+        }
     }
 
-    fn typing(&self) -> bool {
-        true
+    fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    fn command(&mut self, name: &str, ctx: &Ctx) -> Option<Action> {
+        matches!(name, "w" | "send").then(|| {
+            self.send(ctx);
+            Action::None
+        })
     }
 }
 

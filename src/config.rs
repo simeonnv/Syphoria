@@ -20,6 +20,7 @@ pub struct Config {
     pub domains: BTreeSet<FQDN>,
     pub server: ServerConfig,
     pub stalwart: StalwartConfig,
+    pub vault: VaultConfig,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub users: BTreeMap<Username, UserConfig>,
@@ -38,6 +39,12 @@ pub struct StalwartConfig {
     pub url: Url,
     pub admin_user: String,
     pub admin_password_file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    pub dir: PathBuf,
 }
 
 #[serde_as]
@@ -104,6 +111,7 @@ impl Config {
             for file in [
                 &mut config.server.host_key,
                 &mut config.stalwart.admin_password_file,
+                &mut config.vault.dir,
             ] {
                 if file.is_relative() {
                     *file = dir.join(&*file);

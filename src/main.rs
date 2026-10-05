@@ -7,6 +7,7 @@ mod stalwart;
 mod state;
 mod task;
 mod ui;
+mod vault;
 
 use std::{path::PathBuf, time::Duration};
 

@@ -180,17 +180,6 @@ impl Stalwart {
             .or_raise(|| StalwartError(format!("failed to add `{address}` to `{}`", address.owner)))
     }
 
-    pub async fn remove_address(&self, address: &Address) -> exn::Result<(), StalwartError> {
-        self.edit_emails(&address.owner, "removeItem", address.email.as_str())
-            .await
-            .or_raise(|| {
-                StalwartError(format!(
-                    "failed to remove `{address}` from `{}`",
-                    address.owner
-                ))
-            })
-    }
-
     async fn create(&self, principal: Value) -> exn::Result<(), ApiError> {
         match self
             .api::<IgnoredAny>(Method::POST, "api/principal", Some(principal))

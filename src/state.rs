@@ -11,6 +11,7 @@ use russh::keys::{HashAlg, PublicKey, ssh_key::public::KeyData};
 use crate::{
     config::{Config, ServerConfig, Username},
     stalwart::Stalwart,
+    vault::Vault,
 };
 
 #[derive(Debug)]
@@ -32,6 +33,7 @@ impl User {
 pub struct AppStateInner {
     pub server: ServerConfig,
     pub stalwart: Stalwart,
+    pub vault: Vault,
     pub domains: BTreeSet<FQDN>,
     pub users: BTreeMap<Username, User>,
     keys: HashMap<KeyData, Username>,
@@ -54,6 +56,7 @@ impl AppState {
             domains,
             server,
             stalwart,
+            vault,
             users: user_configs,
         } = config;
 
@@ -83,6 +86,7 @@ impl AppState {
         let inner = AppStateInner {
             server,
             stalwart: Stalwart::new(stalwart).map_err(into_anyhow)?,
+            vault: Vault::new(vault).map_err(into_anyhow)?,
             domains,
             users,
             keys,

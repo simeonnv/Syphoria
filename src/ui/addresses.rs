@@ -10,7 +10,9 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 use termwiz::input::Modifiers;
 
-use super::{Action, Ctx, Load, View, line_input, status};
+use super::{
+    Action, Ctx, Load, Mode, View, contains, ctrl, find_match, line_input, list_nav, status, yank,
+};
 use crate::{
     app::{KeyCode, KeyEvent},
     stalwart::Address,
@@ -18,20 +20,19 @@ use crate::{
     task::Task,
 };
 
-enum Mode {
+enum State {
     Browse,
     Create {
         local: Box<TextArea<'static>>,
         domain: usize,
     },
-    Delete(Address),
 }
 
 pub struct Addresses {
     user: &'static User,
     list: Load<Vec<String>>,
     selected: ListState,
-    mode: Mode,
+    state: State,
     error: Option<anyhow::Error>,
 }
 
@@ -41,7 +42,7 @@ impl Addresses {
             user: ctx.user,
             list: Task::new(),
             selected: ListState::default().with_selected(Some(0)),
-            mode: Mode::Browse,
+            state: State::Browse,
             error: None,
         };
         page.reload(ctx);
@@ -54,11 +55,11 @@ impl Addresses {
             .spawn(async move { state.stalwart.addresses(user).await.map_err(into_anyhow) });
     }
 
-    fn selected(&self) -> Option<String> {
+    fn selected(&self) -> Option<&String> {
         let Task::Done(Ok(list)) = &self.list else {
             return None;
         };
-        self.selected.selected().and_then(|i| list.get(i)).cloned()
+        self.selected.selected().and_then(|i| list.get(i))
     }
 }
 
@@ -72,7 +73,7 @@ impl View for Addresses {
         frame.render_widget(block, main);
         match self.list.poll() {
             Task::Done(Ok(list)) if list.is_empty() => {
-                frame.render_widget(Line::from("no addresses yet, press n").dim(), inner);
+                frame.render_widget(Line::from("no addresses yet, press a").dim(), inner);
             }
             Task::Done(Ok(list)) => {
                 let list = List::new(list.iter().map(String::as_str))
@@ -82,8 +83,8 @@ impl View for Addresses {
             other => status(frame, inner, other),
         }
 
-        match &mut self.mode {
-            Mode::Browse => {
+        match &mut self.state {
+            State::Browse => {
                 if let Some(error) = &self.error {
                     frame.render_widget(
                         Paragraph::new(format!("error: {error:#}"))
@@ -93,13 +94,7 @@ impl View for Addresses {
                     );
                 }
             }
-            Mode::Delete(address) => frame.render_widget(
-                Paragraph::new(format!("delete {address}? y/n"))
-                    .red()
-                    .block(Block::bordered()),
-                prompt,
-            ),
-            Mode::Create { local, domain } => {
+            State::Create { local, domain } => {
                 let suffix = self
                     .user
                     .domains
@@ -112,13 +107,14 @@ impl View for Addresses {
                     Constraint::Length(suffix.len() as u16 + 2),
                 ])
                 .areas(prompt);
-                let block = Block::bordered().title(" new address ");
+                let block = Block::bordered().title(" new address · addresses are permanent ");
                 local.set_block(match &self.error {
                     Some(error) => block
                         .title_bottom(Line::from(format!(" {error:#} ")).red())
                         .border_style(Style::new().red()),
-                    None => block.border_style(Style::new().yellow()),
+                    None => block.border_style(Style::new().green()),
                 });
+                local.set_cursor_style(Style::new().reversed());
                 frame.render_widget(&**local, left);
                 frame.render_widget(
                     Paragraph::new(suffix).block(Block::bordered().title(" tab ")),
@@ -130,50 +126,37 @@ impl View for Addresses {
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
         self.error = None;
-        match &mut self.mode {
-            Mode::Browse => match key.key {
-                KeyCode::Char('j') | KeyCode::DownArrow => self.selected.select_next(),
-                KeyCode::Char('k') | KeyCode::UpArrow => self.selected.select_previous(),
-                KeyCode::Char('r') => self.reload(ctx),
-                KeyCode::Char('n') if !ctx.user.domains.is_empty() => {
-                    self.mode = Mode::Create {
-                        local: line_input(random_local_part()),
-                        domain: 0,
-                    };
+        match &mut self.state {
+            State::Browse => {
+                if list_nav(&mut self.selected, &key) {
+                    return Action::None;
                 }
-                KeyCode::Char('d') => {
-                    if let Some(address) = self.selected() {
-                        match Address::new(ctx.user, &address) {
-                            Ok(address) => self.mode = Mode::Delete(address),
-                            Err(e) => self.error = Some(into_anyhow(e)),
+                match key.key {
+                    KeyCode::Char('r') => self.reload(ctx),
+                    KeyCode::Char('a') if !ctx.user.domains.is_empty() => {
+                        self.state = State::Create {
+                            local: line_input(random_local_part()),
+                            domain: 0,
+                        };
+                    }
+                    KeyCode::Char('y') => {
+                        if let Some(address) = self.selected() {
+                            return yank(address);
                         }
                     }
+                    KeyCode::Escape => return Action::Pop,
+                    _ => {}
                 }
-                KeyCode::Escape => return Action::Pop,
-                _ => {}
-            },
-            Mode::Delete(address) => {
-                if key.key == KeyCode::Char('y') {
-                    let (state, user, address) = (ctx.state, ctx.user, address.clone());
-                    self.list.spawn(async move {
-                        state
-                            .stalwart
-                            .remove_address(&address)
-                            .await
-                            .map_err(into_anyhow)?;
-                        state.stalwart.addresses(user).await.map_err(into_anyhow)
-                    });
-                }
-                self.mode = Mode::Browse;
             }
-            Mode::Create { local, domain } => {
+            State::Create { local, domain } => {
                 let domains = ctx.user.domains.len();
                 match key.key {
-                    KeyCode::Escape => self.mode = Mode::Browse,
+                    KeyCode::Escape => self.state = State::Browse,
                     KeyCode::Tab if key.modifiers.contains(Modifiers::SHIFT) => {
                         *domain = (*domain + domains - 1) % domains;
                     }
                     KeyCode::Tab => *domain = (*domain + 1) % domains,
+                    KeyCode::Char('r') if ctrl(&key) => *local = line_input(random_local_part()),
                     KeyCode::Enter => {
                         let (state, user) = (ctx.state, ctx.user);
                         let Some(domain) = user.domains.iter().nth(*domain) else {
@@ -190,7 +173,7 @@ impl View for Addresses {
                                         .map_err(into_anyhow)?;
                                     state.stalwart.addresses(user).await.map_err(into_anyhow)
                                 });
-                                self.mode = Mode::Browse;
+                                self.state = State::Browse;
                             }
                             Err(e) => self.error = Some(into_anyhow(e)),
                         }
@@ -205,15 +188,29 @@ impl View for Addresses {
     }
 
     fn help(&self) -> &'static str {
-        match self.mode {
-            Mode::Browse => "n new · d delete · r reload",
-            Mode::Create { .. } => "type local part · tab domain · enter create · esc cancel",
-            Mode::Delete(_) => "y confirm · any key cancel",
+        match self.state {
+            State::Browse => "a add · y yank · r reload · esc back",
+            State::Create { .. } => "tab domain · ctrl-r random · enter create · esc cancel",
         }
     }
 
-    fn typing(&self) -> bool {
-        matches!(self.mode, Mode::Create { .. })
+    fn mode(&self) -> Mode {
+        match self.state {
+            State::Browse => Mode::Normal,
+            State::Create { .. } => Mode::Insert,
+        }
+    }
+
+    fn search(&mut self, query: &str, forward: bool) {
+        let Task::Done(Ok(list)) = &self.list else {
+            return;
+        };
+        let found = find_match(list.len(), self.selected.selected(), forward, |i| {
+            contains(&list[i], query)
+        });
+        if found.is_some() {
+            self.selected.select(found);
+        }
     }
 }
 

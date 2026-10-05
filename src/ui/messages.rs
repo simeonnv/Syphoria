@@ -1,4 +1,5 @@
 use exn_anyhow::into_anyhow;
+use jmap_client::mailbox::Role;
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
@@ -7,18 +8,27 @@ use ratatui::{
     widgets::{Block, Row, Table, TableState},
 };
 
-use super::{Action, Ctx, Load, Reader, View, date, emails, names, status};
+use super::{
+    Action, Ctx, Load, MOVE, Op, Reader, View, alt, contains, date, emails, find_match, keys_popup,
+    move_target, names, status, table_nav, yank,
+};
 use crate::{
     app::{KeyCode, KeyEvent},
     mail::Summary,
     task::Task,
 };
 
+enum Pending {
+    Move,
+    Destroy(String),
+}
+
 pub struct Messages {
     title: String,
     mailbox: String,
     list: Load<Vec<Summary>>,
     table: TableState,
+    pending: Option<Pending>,
 }
 
 impl Messages {
@@ -28,6 +38,7 @@ impl Messages {
             mailbox,
             list: Task::new(),
             table: TableState::default().with_selected(0),
+            pending: None,
         };
         page.reload(ctx);
         page
@@ -37,6 +48,27 @@ impl Messages {
         let (mail, mailbox) = (ctx.mail.clone(), self.mailbox.clone());
         self.list
             .spawn(async move { mail.summaries(&mailbox).await.map_err(into_anyhow) });
+    }
+
+    fn selected(&self) -> Option<&Summary> {
+        let Task::Done(Ok(list)) = &self.list else {
+            return None;
+        };
+        self.table.selected().and_then(|i| list.get(i))
+    }
+
+    fn run(&mut self, ctx: &Ctx, id: String, op: Op) {
+        let (mail, mailbox) = (ctx.mail.clone(), self.mailbox.clone());
+        self.list.spawn(async move {
+            op.run(&mail, &id).await?;
+            mail.summaries(&mailbox).await.map_err(into_anyhow)
+        });
+    }
+
+    fn run_selected(&mut self, ctx: &Ctx, op: Op) {
+        if let Some(id) = self.selected().map(|m| m.id.clone()) {
+            self.run(ctx, id, op);
+        }
     }
 }
 
@@ -79,20 +111,66 @@ impl View for Messages {
             }
             other => status(frame, inner, other),
         }
+
+        match self.pending {
+            Some(Pending::Move) => keys_popup(frame, area, " move to ", MOVE),
+            Some(Pending::Destroy(_)) => keys_popup(
+                frame,
+                area,
+                " delete permanently? ",
+                &[("y", "yes"), ("any", "cancel")],
+            ),
+            None => {}
+        }
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
+        if let Some(pending) = self.pending.take() {
+            match pending {
+                Pending::Move => {
+                    if let Some(op) = move_target(&key) {
+                        self.run_selected(ctx, op);
+                    }
+                }
+                Pending::Destroy(id) => {
+                    if key.key == KeyCode::Char('y') {
+                        self.run(ctx, id, Op::Destroy);
+                    }
+                }
+            }
+            return Action::None;
+        }
+        if table_nav(&mut self.table, &key) {
+            return Action::None;
+        }
         match key.key {
-            KeyCode::Char('j') | KeyCode::DownArrow => self.table.select_next(),
-            KeyCode::Char('k') | KeyCode::UpArrow => self.table.select_previous(),
-            KeyCode::Char('r') => self.reload(ctx),
             KeyCode::Escape => return Action::Pop,
+            KeyCode::Char('r') => self.reload(ctx),
             KeyCode::Enter => {
                 if let Task::Done(Ok(list)) = &mut self.list
                     && let Some(message) = self.table.selected().and_then(|i| list.get_mut(i))
                 {
                     message.seen = true;
-                    return Action::Push(Reader::new(ctx, message.id.clone()).into());
+                    return Action::Push(Box::new(Reader::new(ctx, message.id.clone()).into()));
+                }
+            }
+            KeyCode::Char('d') if alt(&key) => {
+                if let Some(message) = self.selected() {
+                    self.pending = Some(Pending::Destroy(message.id.clone()));
+                }
+            }
+            KeyCode::Char('d') => self.run_selected(ctx, Op::Move(Role::Trash)),
+            KeyCode::Char('m') => self.pending = Some(Pending::Move),
+            KeyCode::Char('u') => self.run_selected(ctx, Op::Seen(false)),
+            KeyCode::Char('U') => self.run_selected(ctx, Op::Seen(true)),
+            KeyCode::Char('y') if alt(&key) => {
+                if let Some(message) = self.selected() {
+                    return yank(&message.subject);
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(message) = self.selected() {
+                    return yank(&emails(&message.from));
                 }
             }
             _ => {}
@@ -101,6 +179,27 @@ impl View for Messages {
     }
 
     fn help(&self) -> &'static str {
-        "j/k move · enter open · r reload · esc back"
+        "enter open · d trash · alt-d delete · m move · u/U unread/read · y sender · alt-y subject · r reload"
+    }
+
+    fn resume(&mut self, ctx: &Ctx) -> Action {
+        self.reload(ctx);
+        Action::None
+    }
+
+    fn search(&mut self, query: &str, forward: bool) {
+        let Task::Done(Ok(list)) = &self.list else {
+            return;
+        };
+        let found = find_match(list.len(), self.table.selected(), forward, |i| {
+            let m = &list[i];
+            contains(&m.subject, query)
+                || contains(&names(&m.from), query)
+                || contains(&emails(&m.from), query)
+                || contains(&emails(&m.to), query)
+        });
+        if found.is_some() {
+            self.table.select(found);
+        }
     }
 }

@@ -21,6 +21,7 @@ pub struct Mail {
     client: Client,
     pub inbox: String,
     sent: String,
+    mailboxes: Vec<(Role, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,7 @@ pub struct Message {
     pub received: Option<DateTime<Utc>>,
     pub from: Vec<Addr>,
     pub to: Vec<Addr>,
+    pub cc: Vec<Addr>,
     pub subject: String,
     pub body: String,
 }
@@ -70,6 +72,7 @@ impl Mail {
             client,
             inbox: String::new(),
             sent: String::new(),
+            mailboxes: Vec::new(),
         };
 
         let folders = mail.folders().await.or_raise(err)?;
@@ -84,7 +87,44 @@ impl Mail {
         };
         mail.inbox = find(Role::Inbox)?;
         mail.sent = find(Role::Sent)?;
+        mail.mailboxes = folders
+            .into_iter()
+            .filter(|f| f.role != Role::None)
+            .map(|f| (f.role, f.id))
+            .collect();
         Ok(mail)
+    }
+
+    pub async fn move_to(&self, id: &str, role: Role) -> Result<(), MailError> {
+        let err = || MailError(format!("failed to move email `{id}` to {role:?}"));
+        let mailbox = self
+            .mailboxes
+            .iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, mailbox)| mailbox.as_str())
+            .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))
+            .or_raise(err)?;
+        self.client
+            .email_set_mailboxes(id, [mailbox])
+            .await
+            .or_raise(err)?;
+        Ok(())
+    }
+
+    pub async fn destroy(&self, id: &str) -> Result<(), MailError> {
+        self.client
+            .email_destroy(id)
+            .await
+            .or_raise(|| MailError(format!("failed to delete email `{id}`")))
+    }
+
+    pub async fn set_seen(&self, id: &str, seen: bool) -> Result<(), MailError> {
+        let state = if seen { "read" } else { "unread" };
+        self.client
+            .email_set_keyword(id, SEEN, seen)
+            .await
+            .or_raise(|| MailError(format!("failed to mark email `{id}` as {state}")))?;
+        Ok(())
     }
 
     pub async fn folders(&self) -> Result<Vec<Folder>, MailError> {
@@ -170,6 +210,7 @@ impl Mail {
                 Property::ReceivedAt,
                 Property::From,
                 Property::To,
+                Property::Cc,
                 Property::Subject,
                 Property::TextBody,
                 Property::BodyValues,
@@ -204,6 +245,7 @@ impl Mail {
             received: received(email.received_at()),
             from: addrs(email.from()),
             to: addrs(email.to()),
+            cc: addrs(email.cc()),
             subject: email.subject().unwrap_or_default().to_owned(),
             body,
         })

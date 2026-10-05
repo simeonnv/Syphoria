@@ -6,7 +6,9 @@ use ratatui::{
     layout::{Position, Rect, Size},
     style::{Color, Modifier},
 };
+use termwiz::escape::osc::{OperatingSystemCommand, Selection};
 use unicode_width::UnicodeWidthStr;
+use zeroize::{Zeroize, Zeroizing};
 
 pub struct SshBackend {
     size: Rect,
@@ -27,6 +29,15 @@ impl SshBackend {
 
     pub fn take(&mut self) -> Vec<u8> {
         mem::take(&mut self.buf)
+    }
+
+    pub fn clipboard(&mut self, text: &str) {
+        let osc = OperatingSystemCommand::SetSelection(Selection::CLIPBOARD, text.to_owned());
+        let bytes = Zeroizing::new(osc.to_string());
+        if let OperatingSystemCommand::SetSelection(_, mut text) = osc {
+            text.zeroize();
+        }
+        self.write(bytes.as_bytes());
     }
 
     fn write(&mut self, bytes: &[u8]) {
