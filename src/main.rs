@@ -12,10 +12,17 @@ mod vault;
 
 use std::{path::PathBuf, time::Duration};
 
+use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
 use exn::ResultExt;
 
-use crate::{config::Config, error::MainError, ssh::SshServer, state::AppState, ui::Pages};
+use crate::{
+    config::Config,
+    error::{MainError, chain, is_temporary},
+    ssh::SshServer,
+    state::AppState,
+    ui::Pages,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -38,11 +45,26 @@ async fn main() -> exn::Result<(), MainError> {
         state.key_count()
     );
 
-    state
-        .stalwart
-        .provision(&state.domains, state.users.values())
-        .await
-        .or_raise(|| MainError::Provision)?;
+    (|| {
+        state
+            .stalwart
+            .provision(&state.domains, state.users.values())
+    })
+    .retry(
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(500))
+            .with_max_delay(Duration::from_secs(10))
+            .with_max_times(10),
+    )
+    .when(|e| is_temporary(e.frame()))
+    .notify(|e, delay| {
+        println!(
+            "stalwart unavailable, retrying in {delay:?}: {}",
+            chain(e.frame())
+        )
+    })
+    .await
+    .or_raise(|| MainError::Provision)?;
 
     println!("provisioned stalwart");
 

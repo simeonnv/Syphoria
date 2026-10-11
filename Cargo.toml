@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+backon = { version = "1.6.0", default-features = false, features = ["tokio-sleep"] }
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 email_address = "0.2.9"

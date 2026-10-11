@@ -24,6 +24,16 @@
   } @ inputs: let
     forEachSystem = nixpkgs.lib.genAttrs (import systems);
   in {
+    packages = forEachSystem (system: {
+      default = nixpkgs.legacyPackages.${system}.callPackage ./nix/package.nix {};
+    });
+
+    overlays.default = final: prev: {
+      syphoria = final.callPackage ./nix/package.nix {};
+    };
+
+    nixosModules.default = ./nix/module.nix;
+
     devShells = forEachSystem (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
