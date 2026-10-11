@@ -4,12 +4,11 @@ mod compose;
 mod messages;
 mod reader;
 
-use std::sync::Arc;
+use std::{error::Error, sync::Arc};
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use enum_dispatch::enum_dispatch;
-use exn_anyhow::into_anyhow;
+use exn::{Exn, ResultExt};
 use jmap_client::mailbox::Role;
 use ratatui::{
     Frame,
@@ -24,6 +23,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     app::{App, InputEvent, KeyCode, KeyEvent, SshTerminal},
+    error::{UiError, chain, is_temporary},
     mail::{Addr, Folder, Mail},
     state::{AppState, User},
     task::Task,
@@ -36,7 +36,7 @@ use compose::{Compose, Draft};
 use messages::Messages;
 use reader::Reader;
 
-type Load<T> = Task<Result<T>>;
+type Load<T> = Task<exn::Result<T, UiError>>;
 
 const SIDEBAR_WIDTH: u16 = 28;
 const REFRESH_TICKS: u32 = 50;
@@ -112,13 +112,18 @@ pub enum Op {
 }
 
 impl Op {
-    async fn run(self, mail: &Mail, id: &str) -> Result<()> {
+    async fn run(self, mail: &Mail, id: &str) -> exn::Result<(), UiError> {
         match self {
-            Op::Move(role) => mail.move_to(id, role).await,
-            Op::Destroy => mail.destroy(id).await,
-            Op::Seen(seen) => mail.set_seen(id, seen).await,
+            Op::Move(role) => mail
+                .move_to(id, role.clone())
+                .await
+                .or_raise(|| UiError::MoveMessage),
+            Op::Destroy => mail.destroy(id).await.or_raise(|| UiError::DeleteMessage),
+            Op::Seen(seen) => mail
+                .set_seen(id, seen)
+                .await
+                .or_raise(|| UiError::UpdateSeen),
         }
-        .map_err(into_anyhow)
     }
 }
 
@@ -256,7 +261,7 @@ impl Session {
         }
         let mail = self.ctx.mail.clone();
         self.refresh
-            .spawn(async move { mail.folders().await.map_err(into_anyhow) });
+            .spawn(async move { mail.folders().await.or_raise(|| UiError::LoadFolders) });
     }
 
     fn entries(&self) -> Vec<Nav> {
@@ -632,7 +637,11 @@ impl Pages {
         Self {
             user,
             connecting: Task::new_spawn(async move {
-                let mail = state.stalwart.mail(user).await.map_err(into_anyhow)?;
+                let mail = state
+                    .stalwart
+                    .mail(user)
+                    .await
+                    .or_raise(|| UiError::Connect)?;
                 Ok(Ctx {
                     state,
                     user,
@@ -647,7 +656,7 @@ impl Pages {
 }
 
 impl App for Pages {
-    fn render(&mut self, terminal: &mut SshTerminal) -> Result<Option<String>> {
+    fn render(&mut self, terminal: &mut SshTerminal) -> exn::Result<Option<String>, UiError> {
         if self.session.is_none()
             && let Task::Done(Ok(ctx)) = self.connecting.poll()
         {
@@ -657,20 +666,24 @@ impl App for Pages {
         match &mut self.session {
             Some(session) => {
                 session.update();
-                terminal.draw(|frame| session.draw(frame))?;
+                terminal
+                    .draw(|frame| session.draw(frame))
+                    .or_raise(|| UiError::Draw)?;
                 if let Some(text) = session.clipboard.take() {
                     terminal.backend_mut().clipboard(&text);
                 }
                 self.exit |= session.quit;
             }
             None => {
-                terminal.draw(|frame| {
-                    let [body, footer] =
-                        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
-                            .areas(frame.area());
-                    status(frame, body, self.connecting.poll());
-                    frame.render_widget(Line::from(" q quit").dim(), footer);
-                })?;
+                terminal
+                    .draw(|frame| {
+                        let [body, footer] =
+                            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
+                                .areas(frame.area());
+                        status(frame, body, self.connecting.poll());
+                        frame.render_widget(Line::from(" q quit").dim(), footer);
+                    })
+                    .or_raise(|| UiError::Draw)?;
             }
         }
         Ok(self.exit.then(|| format!("bye {}", self.user.name)))
@@ -734,9 +747,18 @@ fn status<T>(frame: &mut Frame, area: Rect, task: &Load<T>) {
         Task::Done(Ok(_)) | Task::Unexecuted => return,
         Task::Running(_) => Line::from("loading…").dim(),
         Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
-        Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
+        Task::Done(Err(e)) => Line::from(failure(e)).red(),
     };
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
+}
+
+fn failure<E: Error + Send + Sync + 'static>(error: &Exn<E>) -> String {
+    let hint = if is_temporary(error.frame()) {
+        " · try again"
+    } else {
+        ""
+    };
+    format!("error: {}{hint}", chain(error.frame()))
 }
 
 fn line_input(text: String) -> Box<TextArea<'static>> {

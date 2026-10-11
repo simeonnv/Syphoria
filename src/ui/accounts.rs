@@ -1,7 +1,6 @@
 use std::mem;
 
-use anyhow::anyhow;
-use exn_anyhow::into_anyhow;
+use exn::{ErrorExt, Exn, ResultExt};
 use rand::RngExt;
 use ratatui::{
     Frame,
@@ -15,11 +14,12 @@ use termwiz::input::Modifiers;
 use zeroize::Zeroizing;
 
 use super::{
-    Action, Ctx, Load, Mode, View, alt, contains, ctrl, cycle, find_match, keys_popup, line_input,
-    pick, status, table_nav, yank,
+    Action, Ctx, Load, Mode, View, alt, contains, ctrl, cycle, failure, find_match, keys_popup,
+    line_input, pick, status, table_nav, yank,
 };
 use crate::{
     app::{KeyCode, KeyEvent},
+    error::UiError,
     task::Task,
     vault::{Account, Db},
 };
@@ -74,7 +74,7 @@ enum State {
         password: Secret,
         first: Option<Zeroizing<String>>,
         attempt: Load<Db>,
-        error: Option<anyhow::Error>,
+        error: Option<Exn<UiError>>,
     },
     Unlocked {
         db: Db,
@@ -115,7 +115,7 @@ fn unlocked(db: Db) -> State {
 
 fn load(db: &Db) -> Load<Vec<Account>> {
     let db = db.clone();
-    Task::new_spawn(async move { db.accounts().await.map_err(into_anyhow) })
+    Task::new_spawn(async move { db.accounts().await.or_raise(|| UiError::LoadAccounts) })
 }
 
 fn selected<'a>(list: &'a Load<Vec<Account>>, table: &TableState) -> Option<&'a Account> {
@@ -151,7 +151,7 @@ impl View for Accounts {
                 ];
                 match (attempt.poll(), error) {
                     (Task::Running(_), _) => lines.push(Line::from("checking…").dim()),
-                    (_, Some(error)) => lines.push(Line::from(format!("{error:#}")).red()),
+                    (_, Some(error)) => lines.push(Line::from(failure(error)).red()),
                     _ => {}
                 }
                 if *setup {
@@ -251,18 +251,26 @@ impl View for Accounts {
                         let (state, user) = (ctx.state, ctx.user);
                         if !*setup {
                             attempt.spawn(async move {
-                                state.vault.unlock(user, typed).await.map_err(into_anyhow)
+                                state
+                                    .vault
+                                    .unlock(user, typed)
+                                    .await
+                                    .or_raise(|| UiError::UnlockVault)
                             });
                         } else if let Some(first) = first.take() {
                             if first == typed {
                                 attempt.spawn(async move {
-                                    state.vault.create(user, typed).await.map_err(into_anyhow)
+                                    state
+                                        .vault
+                                        .create(user, typed)
+                                        .await
+                                        .or_raise(|| UiError::CreateVault)
                                 });
                             } else {
-                                *error = Some(anyhow!("passwords do not match, start over"));
+                                *error = Some(UiError::PasswordMismatch.raise());
                             }
                         } else if typed.chars().count() < MIN_PASSWORD {
-                            *error = Some(anyhow!("use at least {MIN_PASSWORD} characters"));
+                            *error = Some(UiError::PasswordTooShort(MIN_PASSWORD).raise());
                         } else {
                             *first = Some(typed);
                         }
@@ -280,8 +288,10 @@ impl View for Accounts {
                     if key.key == KeyCode::Char('y') {
                         let db = db.clone();
                         *list = Task::new_spawn(async move {
-                            db.delete(&account).await.map_err(into_anyhow)?;
-                            db.accounts().await.map_err(into_anyhow)
+                            db.delete(&account)
+                                .await
+                                .or_raise(|| UiError::DeleteAccount)?;
+                            db.accounts().await.or_raise(|| UiError::LoadAccounts)
                         });
                     }
                     return Action::None;
@@ -356,7 +366,7 @@ impl View for Accounts {
                 Action::None
             }
             Task::Panicked(e) => {
-                *error = Some(e.into());
+                *error = Some(Exn::new(e).raise(UiError::VaultPanicked));
                 Action::None
             }
             Task::Unexecuted | Task::Running(_) => Action::None,
@@ -503,7 +513,11 @@ impl AccountForm {
             db,
             id: account.id,
             addresses: Task::new_spawn(async move {
-                state.stalwart.addresses(user).await.map_err(into_anyhow)
+                state
+                    .stalwart
+                    .addresses(user)
+                    .await
+                    .or_raise(|| UiError::LoadAddresses)
             }),
             address: (!account.address.is_empty()).then(|| account.address.clone()),
             service: line_input(account.service.clone()),
@@ -538,9 +552,7 @@ impl AccountForm {
             return;
         }
         let Some(address) = self.address().cloned() else {
-            self.saving = Task::Done(Err(anyhow!(
-                "you have no address yet, create one in Addresses"
-            )));
+            self.saving = Task::Done(Err(UiError::NoAddress.raise()));
             return;
         };
         let username = self.username.lines().join("");
@@ -560,7 +572,7 @@ impl AccountForm {
         let db = self.db.clone();
         self.mode = Mode::Normal;
         self.saving
-            .spawn(async move { db.save(account).await.map_err(into_anyhow) });
+            .spawn(async move { db.save(account).await.or_raise(|| UiError::SaveAccount) });
     }
 
     fn field(&mut self) -> Option<&mut TextArea<'static>> {
@@ -603,7 +615,7 @@ impl View for AccountForm {
                 "‹ {} ›",
                 self.address().map(String::as_str).unwrap_or_default()
             )),
-            Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
+            Task::Done(Err(e)) => Line::from(failure(e)).red(),
             _ => Line::from("loading…").dim(),
         };
         frame.render_widget(
@@ -639,7 +651,7 @@ impl View for AccountForm {
         let line = match self.saving.poll() {
             Task::Unexecuted | Task::Done(Ok(())) => Line::from(""),
             Task::Running(_) => Line::from("saving…").dim(),
-            Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
+            Task::Done(Err(e)) => Line::from(failure(e)).red(),
             Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         };
         frame.render_widget(line, status);

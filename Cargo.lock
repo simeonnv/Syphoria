@@ -1044,16 +1044,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5592af4187305bf22dc9aa258f98612f6aea4d86e49ea83e6fb2dbe91a5993"
 
 [[package]]
-name = "exn-anyhow"
-version = "0.2.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec8c63189a8e877500a218c19711ab495255a951fc42a7965597847b8fc2f741"
-dependencies = [
- "anyhow",
- "exn",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3917,13 +3907,11 @@ dependencies = [
 name = "syphoria"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "clap",
  "email_address",
  "enum_dispatch",
  "exn",
- "exn-anyhow",
  "fqdn",
  "futures",
  "jmap-client",

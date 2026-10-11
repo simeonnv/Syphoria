@@ -1,4 +1,4 @@
-use exn_anyhow::into_anyhow;
+use exn::{Exn, ResultExt};
 use rand::{RngExt, distr::Alphanumeric};
 use ratatui::{
     Frame,
@@ -11,10 +11,12 @@ use ratatui_textarea::TextArea;
 use termwiz::input::Modifiers;
 
 use super::{
-    Action, Ctx, Load, Mode, View, contains, ctrl, find_match, line_input, list_nav, status, yank,
+    Action, Ctx, Load, Mode, View, contains, ctrl, failure, find_match, line_input, list_nav,
+    status, yank,
 };
 use crate::{
     app::{KeyCode, KeyEvent},
+    error::{InputError, UiError},
     stalwart::Address,
     state::User,
     task::Task,
@@ -33,7 +35,7 @@ pub struct Addresses {
     list: Load<Vec<String>>,
     selected: ListState,
     state: State,
-    error: Option<anyhow::Error>,
+    error: Option<Exn<InputError>>,
 }
 
 impl Addresses {
@@ -51,8 +53,13 @@ impl Addresses {
 
     fn reload(&mut self, ctx: &Ctx) {
         let (state, user) = (ctx.state, ctx.user);
-        self.list
-            .spawn(async move { state.stalwart.addresses(user).await.map_err(into_anyhow) });
+        self.list.spawn(async move {
+            state
+                .stalwart
+                .addresses(user)
+                .await
+                .or_raise(|| UiError::LoadAddresses)
+        });
     }
 
     fn selected(&self) -> Option<&String> {
@@ -87,7 +94,7 @@ impl View for Addresses {
             State::Browse => {
                 if let Some(error) = &self.error {
                     frame.render_widget(
-                        Paragraph::new(format!("error: {error:#}"))
+                        Paragraph::new(failure(error))
                             .red()
                             .block(Block::bordered()),
                         prompt,
@@ -110,7 +117,7 @@ impl View for Addresses {
                 let block = Block::bordered().title(" new address · addresses are permanent ");
                 local.set_block(match &self.error {
                     Some(error) => block
-                        .title_bottom(Line::from(format!(" {error:#} ")).red())
+                        .title_bottom(Line::from(format!(" {} ", failure(error))).red())
                         .border_style(Style::new().red()),
                     None => block.border_style(Style::new().green()),
                 });
@@ -170,12 +177,16 @@ impl View for Addresses {
                                         .stalwart
                                         .add_address(&address)
                                         .await
-                                        .map_err(into_anyhow)?;
-                                    state.stalwart.addresses(user).await.map_err(into_anyhow)
+                                        .or_raise(|| UiError::AddAddress)?;
+                                    state
+                                        .stalwart
+                                        .addresses(user)
+                                        .await
+                                        .or_raise(|| UiError::LoadAddresses)
                                 });
                                 self.state = State::Browse;
                             }
-                            Err(e) => self.error = Some(into_anyhow(e)),
+                            Err(e) => self.error = Some(e),
                         }
                     }
                     _ => {

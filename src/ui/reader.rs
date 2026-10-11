@@ -1,4 +1,4 @@
-use exn_anyhow::into_anyhow;
+use exn::ResultExt;
 use jmap_client::mailbox::Role;
 use ratatui::{
     Frame,
@@ -9,11 +9,12 @@ use ratatui::{
 };
 
 use super::{
-    Action, Compose, Ctx, Draft, Load, MOVE, Op, PAGE, View, alt, date, emails, keys_popup,
-    move_target, status, yank,
+    Action, Compose, Ctx, Draft, Load, MOVE, Op, PAGE, View, alt, date, emails, failure,
+    keys_popup, move_target, status, yank,
 };
 use crate::{
     app::{KeyCode, KeyEvent},
+    error::UiError,
     mail::{Addr, Message},
     task::Task,
 };
@@ -38,7 +39,9 @@ impl Reader {
         Self {
             id,
             message: Task::new_spawn(async move {
-                mail.message(&message_id).await.map_err(into_anyhow)
+                mail.message(&message_id)
+                    .await
+                    .or_raise(|| UiError::LoadMessage)
             }),
             scroll: 0,
             op: Task::new(),
@@ -68,7 +71,7 @@ impl View for Reader {
         match self.op.poll() {
             Task::Running(_) => block = block.title_bottom(Line::from(" working… ").dim()),
             Task::Done(Err(e)) => {
-                block = block.title_bottom(Line::from(format!(" error: {e:#} ")).red());
+                block = block.title_bottom(Line::from(format!(" {} ", failure(e))).red());
             }
             _ => {}
         }

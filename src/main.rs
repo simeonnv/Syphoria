@@ -1,6 +1,7 @@
 mod app;
 mod backend;
 mod config;
+mod error;
 mod mail;
 mod ssh;
 mod stalwart;
@@ -11,11 +12,10 @@ mod vault;
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
 use clap::Parser;
-use exn_anyhow::into_anyhow;
+use exn::ResultExt;
 
-use crate::{config::Config, ssh::SshServer, state::AppState, ui::Pages};
+use crate::{config::Config, error::MainError, ssh::SshServer, state::AppState, ui::Pages};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -25,10 +25,10 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> exn::Result<(), MainError> {
     let args = Args::parse();
-    let state = AppState::new(Config::load(&args.config)?)
-        .with_context(|| format!("invalid config {}", args.config.display()))?;
+    let config = Config::load(&args.config).or_raise(|| MainError::LoadConfig)?;
+    let state = AppState::new(config).or_raise(|| MainError::InvalidConfig)?;
 
     println!(
         "loaded {}: {} domain(s), {} user(s), {} key(s)",
@@ -42,12 +42,12 @@ async fn main() -> Result<()> {
         .stalwart
         .provision(&state.domains, state.users.values())
         .await
-        .map_err(into_anyhow)
-        .context("provisioning stalwart")?;
+        .or_raise(|| MainError::Provision)?;
 
     println!("provisioned stalwart");
 
-    let host_key = ssh::load_or_create_host_key(&state.server.host_key)?;
+    let host_key =
+        ssh::load_or_create_host_key(&state.server.host_key).or_raise(|| MainError::HostKey)?;
     let server = SshServer {
         state,
         factory: |state, user| Box::new(Pages::new(state, user)),
@@ -55,5 +55,8 @@ async fn main() -> Result<()> {
     };
 
     println!("listening on {}", state.server.listen);
-    server.run(ssh::config(host_key), state.server.listen).await
+    server
+        .run(ssh::config(host_key), state.server.listen)
+        .await
+        .or_raise(|| MainError::Serve)
 }

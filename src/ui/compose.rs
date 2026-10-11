@@ -1,8 +1,7 @@
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow, ensure};
 use email_address::EmailAddress;
-use exn_anyhow::into_anyhow;
+use exn::{ErrorExt, ResultExt, ensure};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -13,9 +12,10 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 use termwiz::input::Modifiers;
 
-use super::{Action, Ctx, Load, Mode, View, ctrl, cycle, line_input, pick};
+use super::{Action, Ctx, Load, Mode, View, ctrl, cycle, failure, line_input, pick};
 use crate::{
     app::{KeyCode, KeyEvent},
+    error::{InputError, UiError},
     task::Task,
 };
 
@@ -72,7 +72,11 @@ impl Compose {
         body.set_cursor_line_style(Style::new());
         Self {
             addresses: Task::new_spawn(async move {
-                state.stalwart.addresses(user).await.map_err(into_anyhow)
+                state
+                    .stalwart
+                    .addresses(user)
+                    .await
+                    .or_raise(|| UiError::LoadAddresses)
             }),
             from: draft.from,
             to: line_input(draft.to),
@@ -102,22 +106,21 @@ impl Compose {
             return;
         }
         let Some(from) = self.sender().cloned() else {
-            self.sending = Task::Done(Err(anyhow!(
-                "you have no address to send from, create one in Addresses"
-            )));
+            self.sending = Task::Done(Err(UiError::NoAddress.raise()));
             return;
         };
         if !ctx.user.owns(&from) {
-            self.sending = Task::Done(Err(anyhow!("`{from}` is not on one of your domains")));
+            self.sending = Task::Done(Err(UiError::ForeignSender.raise()));
             return;
         }
-        let to = match recipients(&self.to.lines().join(",")) {
-            Ok(to) => to,
-            Err(e) => {
-                self.sending = Task::Done(Err(e));
-                return;
-            }
-        };
+        let to =
+            match recipients(&self.to.lines().join(",")).or_raise(|| UiError::InvalidRecipients) {
+                Ok(to) => to,
+                Err(e) => {
+                    self.sending = Task::Done(Err(e));
+                    return;
+                }
+            };
         let mail = ctx.mail.clone();
         let name = ctx.user.name.to_string();
         let subject = self.subject.lines().join(" ");
@@ -126,7 +129,7 @@ impl Compose {
         self.sending.spawn(async move {
             mail.send(&name, &from, &to, &subject, &body)
                 .await
-                .map_err(into_anyhow)
+                .or_raise(|| UiError::SendMessage)
         });
     }
 
@@ -167,7 +170,7 @@ impl View for Compose {
                 "‹ {} ›",
                 self.sender().map(String::as_str).unwrap_or_default()
             )),
-            Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
+            Task::Done(Err(e)) => Line::from(failure(e)).red(),
             _ => Line::from("loading…").dim(),
         };
         frame.render_widget(
@@ -193,7 +196,7 @@ impl View for Compose {
             Task::Unexecuted => Line::from(""),
             Task::Running(_) => Line::from("sending…").dim(),
             Task::Done(Ok(())) => Line::from("sent ✓").green(),
-            Task::Done(Err(e)) => Line::from(format!("error: {e:#}")).red(),
+            Task::Done(Err(e)) => Line::from(failure(e)).red(),
             Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         };
         frame.render_widget(line, status);
@@ -253,7 +256,7 @@ impl View for Compose {
     }
 }
 
-fn recipients(raw: &str) -> Result<Vec<String>> {
+fn recipients(raw: &str) -> exn::Result<Vec<String>, InputError> {
     let to = raw
         .split(',')
         .map(str::trim)
@@ -261,9 +264,9 @@ fn recipients(raw: &str) -> Result<Vec<String>> {
         .map(|s| {
             EmailAddress::from_str(s)
                 .map(|_| s.to_owned())
-                .with_context(|| format!("invalid recipient `{s}`"))
+                .or_raise(|| InputError::InvalidRecipient(s.to_owned()))
         })
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(!to.is_empty(), "add at least one recipient");
+        .collect::<exn::Result<Vec<_>, InputError>>()?;
+    ensure!(!to.is_empty(), InputError::NoRecipients);
     Ok(to)
 }

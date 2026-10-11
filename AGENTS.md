@@ -9,7 +9,7 @@
 - No `static`, `OnceLock`, lazy globals. Pass state explicitly.
 - Prefer existing crates over hand-rolled code. Research, check version compat (ratatui 0.30, termwiz 0.23, reqwest 0.13).
 - Hand-roll validation only when crate errors are bad (e.g. regex validators).
-- Simplest code wins. No pointless wrappers (`main` returns `anyhow::Result` directly).
+- Simplest code wins. No pointless wrappers (`main` returns `exn::Result<(), MainError>` directly).
 - Be concise.
 - Write your md files in a very short but yet concise way.
 
@@ -29,15 +29,17 @@
 
 ## Errors
 
-- Modules: `exn::Result<T, ModError>`, `ModError` = thiserror struct describing what this layer does.
-- Add context per boundary with `or_raise(|| ...)` / `ok_or_raise`, `bail!`/`ensure!` for new errors. Never flatten into strings.
-- Context names what failed at that call, not what the function does; callers add that. No shared `let err = || ...` closures.
-- Don't re-wrap errors that already carry context from the same layer (`.ok_or_raise(..).or_raise(err)`).
+- All error types live in `src/error.rs`, by situation.
+- Each error has only the fields it needs. Kinds are per type and say what the caller can do.
+  - `StorageError { kind: StorageKind, message }`, temporary when `Locked`.
+  - `RemoteError { kind: RemoteKind, status, message }`, `status` = `Temporary` if a retry may help.
+  - Message only: `ConfigError`, `InputError` (validation), `SshError`, `UiError`, `MainError`. `HandlerError` wraps `Exn<SshError>` for russh.
+- Return `exn::Result<T, E>`. Cross situations with `or_raise(|| ...)` / `ok_or_raise`; new errors via `bail!`/`ensure!`/`.raise()`. Never flatten into strings.
+- Same situation: plain `?`, or `or_raise` to add context. jmap errors: `RemoteError::jmap`.
+- Context names what failed at that call; callers add the rest. One context per call, no shared `let err = || ...` closures.
 - Never drop errors (`let _ =`, `.ok()`, `map_err(|_| ..)`, `Err(_) =>`). Propagate; if cleanup also fails keep both as children (`IteratorExt::raise`). Exception: non-fatal teardown (closing channels).
-- Helpers return `exn::Result` with per-step context; don't `?`-flatten several foreign calls under one context.
-- Print with `{e:#}`.
-- Top level (main, config, ui) uses `anyhow`; convert with `exn_anyhow::into_anyhow`, print with `{e:#}`.
-- Match API errors before raising (e.g. `Reply::Error(ApiError::FieldAlreadyExists)`), don't downcast.
+- Machines: outer frames' kind may not match the cause, so walk the tree (`is_temporary`). Top-frame `kind` only where the error is raised (e.g. `AlreadyExists` in `Stalwart::create`).
+- Humans: `{e:?}` prints the tree (logs, main); UI shows one line via `ui::failure` (`chain` + retry hint).
 
 ## Dev
 

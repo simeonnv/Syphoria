@@ -1,7 +1,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use exn::{OptionExt, Result, ResultExt};
+use exn::{OptionExt, Result};
 use jmap_client::{
     client::Client,
     core::{response::EmailSetResponse, set::SetObject},
@@ -10,9 +10,7 @@ use jmap_client::{
 };
 use url::Url;
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct MailError(String);
+use crate::error::RemoteError;
 
 const SEEN: &str = "$seen";
 const PAGE: usize = 200;
@@ -59,13 +57,13 @@ pub struct Message {
 }
 
 impl Mail {
-    pub async fn connect(url: &Url, login: &str, password: &str) -> Result<Self, MailError> {
+    pub async fn connect(url: &Url, login: &str, password: &str) -> Result<Self, RemoteError> {
         let client = Client::new()
             .credentials((login, password))
             .follow_redirects(url.host_str())
             .connect(url.as_str().trim_end_matches('/'))
             .await
-            .or_raise(|| MailError(format!("failed to connect to {url} as `{login}`")))?;
+            .map_err(RemoteError::jmap)?;
 
         let mut mail = Self {
             client,
@@ -81,7 +79,7 @@ impl Mail {
                 .iter()
                 .find(|f| f.role == role)
                 .map(|f| f.id.clone())
-                .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))
+                .ok_or_raise(|| RemoteError::NoMailbox(format!("{role:?}")))
         };
         mail.inbox = find(Role::Inbox)?;
         mail.sent = find(Role::Sent)?;
@@ -93,37 +91,36 @@ impl Mail {
         Ok(mail)
     }
 
-    pub async fn move_to(&self, id: &str, role: Role) -> Result<(), MailError> {
+    pub async fn move_to(&self, id: &str, role: Role) -> Result<(), RemoteError> {
         let mailbox = self
             .mailboxes
             .iter()
             .find(|(r, _)| *r == role)
             .map(|(_, mailbox)| mailbox.as_str())
-            .ok_or_raise(|| MailError(format!("account has no {role:?} mailbox")))?;
+            .ok_or_raise(|| RemoteError::NoMailbox(format!("{role:?}")))?;
         self.client
             .email_set_mailboxes(id, [mailbox])
             .await
-            .or_raise(|| MailError(format!("failed to move email `{id}` to {role:?}")))?;
+            .map_err(RemoteError::jmap)?;
         Ok(())
     }
 
-    pub async fn destroy(&self, id: &str) -> Result<(), MailError> {
+    pub async fn destroy(&self, id: &str) -> Result<(), RemoteError> {
         self.client
             .email_destroy(id)
             .await
-            .or_raise(|| MailError(format!("failed to delete email `{id}`")))
+            .map_err(RemoteError::jmap)
     }
 
-    pub async fn set_seen(&self, id: &str, seen: bool) -> Result<(), MailError> {
-        let state = if seen { "read" } else { "unread" };
+    pub async fn set_seen(&self, id: &str, seen: bool) -> Result<(), RemoteError> {
         self.client
             .email_set_keyword(id, SEEN, seen)
             .await
-            .or_raise(|| MailError(format!("failed to mark email `{id}` as {state}")))?;
+            .map_err(RemoteError::jmap)?;
         Ok(())
     }
 
-    pub async fn folders(&self) -> Result<Vec<Folder>, MailError> {
+    pub async fn folders(&self) -> Result<Vec<Folder>, RemoteError> {
         let mut request = self.client.build();
         request.get_mailbox().properties([
             mailbox::Property::Id,
@@ -136,7 +133,7 @@ impl Mail {
         let mut list = request
             .send_get_mailbox()
             .await
-            .or_raise(|| MailError("failed to list mailboxes".into()))?
+            .map_err(RemoteError::jmap)?
             .take_list();
         list.sort_by_key(|m| (rank(&m.role()), m.sort_order(), m.name().map(str::to_owned)));
 
@@ -151,7 +148,7 @@ impl Mail {
             .collect())
     }
 
-    pub async fn summaries(&self, mailbox: &str) -> Result<Vec<Summary>, MailError> {
+    pub async fn summaries(&self, mailbox: &str) -> Result<Vec<Summary>, RemoteError> {
         let mut request = self.client.build();
         let query = request
             .query_email()
@@ -172,12 +169,12 @@ impl Mail {
         let list = request
             .send()
             .await
-            .or_raise(|| MailError(format!("failed to query emails in mailbox `{mailbox}`")))?
+            .map_err(RemoteError::jmap)?
             .unwrap_method_responses()
             .pop()
-            .ok_or_raise(|| MailError("server returned no Email/get response".into()))?
+            .ok_or_raise(|| RemoteError::Internal)?
             .unwrap_get_email()
-            .or_raise(|| MailError("Email/get failed".into()))?
+            .map_err(RemoteError::jmap)?
             .take_list();
 
         Ok(list
@@ -193,7 +190,7 @@ impl Mail {
             .collect())
     }
 
-    pub async fn message(&self, id: &str) -> Result<Message, MailError> {
+    pub async fn message(&self, id: &str) -> Result<Message, RemoteError> {
         let mut request = self.client.build();
         request
             .get_email()
@@ -214,10 +211,10 @@ impl Mail {
         let email = request
             .send_get_email()
             .await
-            .or_raise(|| MailError(format!("failed to fetch email `{id}`")))?
+            .map_err(RemoteError::jmap)?
             .take_list()
             .pop()
-            .ok_or_raise(|| MailError(format!("email `{id}` not found")))?;
+            .ok_or_raise(|| RemoteError::NotFound)?;
 
         let body = email
             .text_body()
@@ -231,7 +228,7 @@ impl Mail {
         self.client
             .email_set_keyword(id, SEEN, true)
             .await
-            .or_raise(|| MailError(format!("failed to mark email `{id}` as read")))?;
+            .map_err(RemoteError::jmap)?;
 
         Ok(Message {
             received: received(email.received_at()),
@@ -250,7 +247,7 @@ impl Mail {
         to: &[String],
         subject: &str,
         body: &str,
-    ) -> Result<(), MailError> {
+    ) -> Result<(), RemoteError> {
         let identity = self.identity(name, from).await?;
 
         let mut request = self.client.build();
@@ -269,33 +266,31 @@ impl Mail {
             )
             .body_value("body".into(), body);
 
-        let create_id = email
-            .create_id()
-            .ok_or_raise(|| MailError("email has no create id".into()))?;
+        let create_id = email.create_id().ok_or_raise(|| RemoteError::Internal)?;
 
         let email_id = request
             .send_single::<EmailSetResponse>()
             .await
-            .or_raise(|| MailError("failed to create email".into()))?
+            .map_err(RemoteError::jmap)?
             .created(&create_id)
-            .or_raise(|| MailError("server did not create email".into()))?
+            .map_err(RemoteError::jmap)?
             .take_id();
 
         self.client
             .email_submission_create(email_id.as_str(), identity)
             .await
-            .or_raise(|| MailError(format!("failed to submit email `{email_id}`")))?;
+            .map_err(RemoteError::jmap)?;
         Ok(())
     }
 
-    async fn identity(&self, name: &str, email: &str) -> Result<String, MailError> {
+    async fn identity(&self, name: &str, email: &str) -> Result<String, RemoteError> {
         let mut request = self.client.build();
         request.get_identity();
 
         let existing = request
             .send_get_identity()
             .await
-            .or_raise(|| MailError("failed to list identities".into()))?
+            .map_err(RemoteError::jmap)?
             .take_list()
             .into_iter()
             .find(|i| i.email() == Some(email));
@@ -306,7 +301,7 @@ impl Mail {
                 .client
                 .identity_create(name, email)
                 .await
-                .or_raise(|| MailError(format!("failed to create identity for `{email}`")))?,
+                .map_err(RemoteError::jmap)?,
         };
         Ok(identity.take_id())
     }

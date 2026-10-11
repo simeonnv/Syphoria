@@ -5,12 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use exn::ResultExt;
 use fqdn::FQDN;
 use russh::keys::PublicKey;
 use serde::Deserialize;
 use serde_with::{DisplayFromStr, MapPreventDuplicates, SetPreventDuplicates, serde_as};
 use url::Url;
+
+use crate::error::ConfigError;
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -101,11 +103,9 @@ impl fmt::Display for Username {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let mut config: Config =
-            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    pub fn load(path: &Path) -> exn::Result<Self, ConfigError> {
+        let text = fs::read_to_string(path).or_raise(|| ConfigError::Read)?;
+        let mut config: Config = toml::from_str(&text).or_raise(|| ConfigError::Parse)?;
 
         if let Some(dir) = path.parent() {
             for file in [

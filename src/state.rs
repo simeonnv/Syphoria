@@ -3,13 +3,13 @@ use std::{
     ops::Deref,
 };
 
-use anyhow::{Result, bail};
-use exn_anyhow::into_anyhow;
+use exn::{ResultExt, bail};
 use fqdn::FQDN;
 use russh::keys::{HashAlg, PublicKey, ssh_key::public::KeyData};
 
 use crate::{
     config::{Config, ServerConfig, Username},
+    error::ConfigError,
     stalwart::Stalwart,
     vault::Vault,
 };
@@ -51,7 +51,7 @@ impl Deref for AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> exn::Result<Self, ConfigError> {
         let Config {
             domains,
             server,
@@ -65,12 +65,13 @@ impl AppState {
 
         for (name, cfg) in user_configs {
             if let Some(domain) = cfg.domains.difference(&domains).next() {
-                bail!("user `{name}`: domain `{domain}` is not in the global `domains` list");
+                bail!(ConfigError::UnknownDomain(domain.to_string()));
             }
             for key in &cfg.ssh_keys {
-                if let Some(owner) = keys.insert(key.key_data().clone(), name.clone()) {
-                    let fp = key.fingerprint(HashAlg::Sha256);
-                    bail!("user `{name}`: ssh key {fp} is already assigned to user `{owner}`");
+                if keys.insert(key.key_data().clone(), name.clone()).is_some() {
+                    bail!(ConfigError::DuplicateKey(
+                        key.fingerprint(HashAlg::Sha256).to_string()
+                    ));
                 }
             }
 
@@ -85,8 +86,8 @@ impl AppState {
 
         let inner = AppStateInner {
             server,
-            stalwart: Stalwart::new(stalwart).map_err(into_anyhow)?,
-            vault: Vault::new(vault).map_err(into_anyhow)?,
+            stalwart: Stalwart::new(stalwart)?,
+            vault: Vault::new(vault).or_raise(|| ConfigError::Vault)?,
             domains,
             users,
             keys,

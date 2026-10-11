@@ -1,6 +1,6 @@
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, anyhow};
+use exn::{OptionExt, ResultExt};
 use ratatui::Terminal;
 use russh::{
     Channel, ChannelId, MethodKind, MethodSet, Pty,
@@ -11,11 +11,12 @@ use russh::{
     server::{Auth, Config, Handle, Handler, Msg, Server, Session},
 };
 use termwiz::input::{InputEvent, InputParser, KeyCode, KeyEvent, Modifiers};
-use tokio::{net::ToSocketAddrs, sync::mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
     app::App,
     backend::SshBackend,
+    error::{HandlerError, SshError, StorageError},
     state::{AppState, User},
 };
 
@@ -42,22 +43,21 @@ pub fn config(host_key: PrivateKey) -> Config {
     }
 }
 
-pub fn load_or_create_host_key(path: &Path) -> Result<PrivateKey> {
+pub fn load_or_create_host_key(path: &Path) -> exn::Result<PrivateKey, StorageError> {
     if path.exists() {
-        return PrivateKey::read_openssh_file(path)
-            .with_context(|| format!("reading host key {}", path.display()));
+        return PrivateKey::read_openssh_file(path).or_raise(|| StorageError::ReadHostKey);
     }
 
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
     {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating host key directory {}", dir.display()))?;
+        fs::create_dir_all(dir).or_raise(|| StorageError::CreateHostKey)?;
     }
 
-    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        .or_raise(|| StorageError::CreateHostKey)?;
     key.write_openssh_file(path, LineEnding::LF)
-        .with_context(|| format!("writing host key {}", path.display()))?;
+        .or_raise(|| StorageError::CreateHostKey)?;
 
     println!("generated new host key at {}", path.display());
 
@@ -65,15 +65,21 @@ pub fn load_or_create_host_key(path: &Path) -> Result<PrivateKey> {
 }
 
 impl SshServer {
-    pub async fn run(self, config: Config, addr: impl ToSocketAddrs + Send) -> Result<()> {
+    pub async fn run(self, config: Config, addr: SocketAddr) -> exn::Result<(), SshError> {
         let mut server = self;
-        server.run_on_address(Arc::new(config), addr).await?;
-        Ok(())
+        server
+            .run_on_address(Arc::new(config), addr)
+            .await
+            .or_raise(|| SshError::Serve)
     }
 }
 
 impl Server for SshServer {
     type Handler = SessionHandler;
+
+    fn handle_session_error(&mut self, error: HandlerError) {
+        eprintln!("session error: {:?}", error.0);
+    }
 
     fn new_client(&mut self, peer: Option<SocketAddr>) -> SessionHandler {
         SessionHandler {
@@ -146,24 +152,28 @@ impl SessionHandler {
 }
 
 impl Handler for SessionHandler {
-    type Error = anyhow::Error;
+    type Error = HandlerError;
 
-    async fn auth_none(&mut self, _user: &str) -> Result<Auth> {
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, HandlerError> {
         Ok(Self::reject_try_publickey())
     }
 
-    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth> {
+    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, HandlerError> {
         Ok(Self::reject_try_publickey())
     }
 
-    async fn auth_publickey_offered(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        key: &PublicKey,
+    ) -> Result<Auth, HandlerError> {
         Ok(match self.lookup(key) {
             Some(_) => Auth::Accept,
             None => Self::reject_try_publickey(),
         })
     }
 
-    async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
+    async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth, HandlerError> {
         let Some(user) = self.lookup(key) else {
             return Ok(Self::reject_try_publickey());
         };
@@ -171,10 +181,8 @@ impl Handler for SessionHandler {
         Ok(Auth::Accept)
     }
 
-    async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<()> {
-        let user = self
-            .user
-            .ok_or_else(|| anyhow!("auth succeeded without a public key"))?;
+    async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), HandlerError> {
+        let user = self.user.ok_or_raise(|| SshError::NoPublicKey)?;
 
         println!("connected: {} from {}", user.name, self.peer());
 
@@ -186,7 +194,7 @@ impl Handler for SessionHandler {
         &mut self,
         _channel: Channel<Msg>,
         _session: &mut Session,
-    ) -> Result<bool> {
+    ) -> Result<bool, HandlerError> {
         Ok(true)
     }
 
@@ -201,27 +209,35 @@ impl Handler for SessionHandler {
         _px_h: u32,
         _modes: &[(Pty, u32)],
         session: &mut Session,
-    ) -> Result<()> {
+    ) -> Result<(), HandlerError> {
         self.size = (cols as u16, rows as u16);
-        session.channel_success(channel)?;
+        session
+            .channel_success(channel)
+            .or_raise(|| SshError::Pty)?;
         Ok(())
     }
 
-    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
-        let app = self
-            .app
-            .take()
-            .ok_or_else(|| anyhow!("shell requested before app was built"))?;
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        let app = self.app.take().ok_or_raise(|| SshError::NoApp)?;
 
-        session.channel_success(channel)?;
-        session.data(channel, ENTER_ALT_SCREEN.into())?;
+        session
+            .channel_success(channel)
+            .or_raise(|| SshError::Shell)?;
+        session
+            .data(channel, ENTER_ALT_SCREEN.into())
+            .or_raise(|| SshError::AltScreen)?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.events = Some(tx);
 
         let runner = SessionTask {
             app,
-            terminal: Terminal::new(SshBackend::new(self.size.0, self.size.1))?,
+            terminal: Terminal::new(SshBackend::new(self.size.0, self.size.1))
+                .or_raise(|| SshError::Terminal)?,
             handle: session.handle(),
             channel,
             refresh_rate: self.refresh_rate,
@@ -235,7 +251,7 @@ impl Handler for SessionHandler {
         _channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
-    ) -> Result<()> {
+    ) -> Result<(), HandlerError> {
         let mut events = Vec::new();
         self.parser.parse(data, |e| events.push(e), false);
 
@@ -261,7 +277,7 @@ impl Handler for SessionHandler {
         _px_w: u32,
         _px_h: u32,
         _session: &mut Session,
-    ) -> Result<()> {
+    ) -> Result<(), HandlerError> {
         self.size = (cols as u16, rows as u16);
         self.send(Event::Resize(cols as u16, rows as u16));
         Ok(())
@@ -293,7 +309,7 @@ impl SessionTask {
         });
 
         if let Err(e) = self.render().await {
-            eprintln!("render error: {e}");
+            eprintln!("render error: {e:?}");
             return;
         }
 
@@ -326,7 +342,7 @@ impl SessionTask {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("render error: {e}");
+                    eprintln!("render error: {e:?}");
                     close(&self.handle, self.channel, Some("internal error".into())).await;
                     return;
                 }
@@ -334,14 +350,17 @@ impl SessionTask {
         }
     }
 
-    async fn render(&mut self) -> Result<Option<String>> {
-        let exit = self.app.render(&mut self.terminal)?;
+    async fn render(&mut self) -> exn::Result<Option<String>, SshError> {
+        let exit = self
+            .app
+            .render(&mut self.terminal)
+            .or_raise(|| SshError::Render)?;
         let bytes = self.terminal.backend_mut().take();
         if !bytes.is_empty() {
             self.handle
                 .data(self.channel, bytes.into())
                 .await
-                .map_err(|_| anyhow!("channel closed"))?;
+                .map_err(|_| SshError::ChannelClosed)?;
         }
         Ok(exit)
     }

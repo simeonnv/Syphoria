@@ -1,4 +1,4 @@
-use exn_anyhow::into_anyhow;
+use exn::ResultExt;
 use jmap_client::mailbox::Role;
 use ratatui::{
     Frame,
@@ -14,6 +14,7 @@ use super::{
 };
 use crate::{
     app::{KeyCode, KeyEvent},
+    error::UiError,
     mail::Summary,
     task::Task,
 };
@@ -46,8 +47,11 @@ impl Messages {
 
     fn reload(&mut self, ctx: &Ctx) {
         let (mail, mailbox) = (ctx.mail.clone(), self.mailbox.clone());
-        self.list
-            .spawn(async move { mail.summaries(&mailbox).await.map_err(into_anyhow) });
+        self.list.spawn(async move {
+            mail.summaries(&mailbox)
+                .await
+                .or_raise(|| UiError::LoadMessages)
+        });
     }
 
     fn selected(&self) -> Option<&Summary> {
@@ -61,7 +65,9 @@ impl Messages {
         let (mail, mailbox) = (ctx.mail.clone(), self.mailbox.clone());
         self.list.spawn(async move {
             op.run(&mail, &id).await?;
-            mail.summaries(&mailbox).await.map_err(into_anyhow)
+            mail.summaries(&mailbox)
+                .await
+                .or_raise(|| UiError::LoadMessages)
         });
     }
 
