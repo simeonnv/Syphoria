@@ -13,7 +13,7 @@ use crate::{
     config::{StalwartConfig, Username},
     error::{ApiError, ConfigError, InputError, RemoteError},
     mail::Mail,
-    state::User,
+    state::{Grant, User},
 };
 
 #[derive(Deserialize)]
@@ -40,6 +40,10 @@ pub struct Address {
 impl Address {
     pub fn new(user: &User, address: &str) -> exn::Result<Self, InputError> {
         let email = EmailAddress::from_str(address).or_raise(|| InputError::InvalidAddress)?;
+        ensure!(
+            matches!(user.grant, Grant::Domains(_)),
+            InputError::FixedAddresses
+        );
         ensure!(user.owns(address), InputError::ForeignDomain);
         Ok(Self {
             owner: user.name.clone(),
@@ -96,7 +100,8 @@ impl Stalwart {
                 .await?;
         }
 
-        for user in users {
+        let users: Vec<&User> = users.into_iter().collect();
+        for user in &users {
             self.create(
                 json!({ "type": "individual", "name": user.name.to_string(), "roles": ["user"] }),
             )
@@ -104,11 +109,36 @@ impl Stalwart {
 
             for address in self.addresses(user).await? {
                 if !user.owns(&address) {
-                    println!(
-                        "removing {address} from {}: domain no longer assigned",
-                        user.name
-                    );
+                    println!("removing {address} from {}: no longer assigned", user.name);
                     self.edit_emails(&user.name, "removeItem", &address).await?;
+                }
+            }
+        }
+
+        for user in &users {
+            let Grant::Addresses(fixed) = &user.grant else {
+                continue;
+            };
+            let current = self.addresses(user).await?;
+            for address in fixed {
+                if current
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(address.as_str()))
+                {
+                    continue;
+                }
+                match self
+                    .edit_emails(&user.name, "addItem", address.as_str())
+                    .await
+                {
+                    Ok(()) => println!("assigned {address} to {}", user.name),
+                    Err(e) if matches!(*e, RemoteError::AlreadyExists) => {
+                        println!(
+                            "not assigning {address} to {}: claimed by another account",
+                            user.name
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         }

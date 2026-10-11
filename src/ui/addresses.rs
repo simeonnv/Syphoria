@@ -17,7 +17,7 @@ use crate::{
     app::KeyEvent,
     error::{InputError, UiError},
     stalwart::Address,
-    state::User,
+    state::{Grant, User},
     task::Task,
 };
 
@@ -74,15 +74,22 @@ impl View for Addresses {
         let [main, prompt] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
 
-        let block = theme::block().title(" Addresses ");
+        let fixed = matches!(self.user.grant, Grant::Addresses(_));
+        let block = theme::block().title(if fixed {
+            " Addresses \u{b7} assigned by admin "
+        } else {
+            " Addresses "
+        });
         let inner = block.inner(main);
         frame.render_widget(block, main);
         match self.list.poll() {
             Task::Done(Ok(list)) if list.is_empty() => {
-                frame.render_widget(
-                    Line::from("no addresses yet, press a").fg(theme::SUBTLE),
-                    inner,
-                );
+                let empty = if fixed {
+                    "no addresses assigned"
+                } else {
+                    "no addresses yet, press a"
+                };
+                frame.render_widget(Line::from(empty).fg(theme::SUBTLE), inner);
             }
             Task::Done(Ok(list)) => {
                 let list =
@@ -104,8 +111,8 @@ impl View for Addresses {
             State::Create { local, domain } => {
                 let suffix = self
                     .user
-                    .domains
-                    .iter()
+                    .domains()
+                    .into_iter()
                     .nth(*domain)
                     .map(|d| format!("@{d}"))
                     .unwrap_or_default();
@@ -140,7 +147,7 @@ impl View for Addresses {
                 }
                 match keys::Addresses::get(&key) {
                     Some(keys::Addresses::Reload) => self.reload(ctx),
-                    Some(keys::Addresses::Add) if !ctx.user.domains.is_empty() => {
+                    Some(keys::Addresses::Add) if !ctx.user.domains().is_empty() => {
                         self.state = State::Create {
                             local: line_input(random_local_part()),
                             domain: 0,
@@ -156,7 +163,7 @@ impl View for Addresses {
                 }
             }
             State::Create { local, domain } => {
-                let domains = ctx.user.domains.len();
+                let domains = ctx.user.domains().len();
                 match keys::NewAddress::get(&key) {
                     Some(keys::NewAddress::Cancel) => self.state = State::Browse,
                     Some(keys::NewAddress::Prev) => *domain = (*domain + domains - 1) % domains,
@@ -164,7 +171,7 @@ impl View for Addresses {
                     Some(keys::NewAddress::Random) => *local = line_input(random_local_part()),
                     Some(keys::NewAddress::Create) => {
                         let (state, user) = (ctx.state, ctx.user);
-                        let Some(domain) = user.domains.iter().nth(*domain) else {
+                        let Some(domain) = user.domains().into_iter().nth(*domain) else {
                             return Action::None;
                         };
                         let address = format!("{}@{domain}", local.lines().join(""));

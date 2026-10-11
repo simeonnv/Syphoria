@@ -1,4 +1,4 @@
-domains = ["cool.com", "awesome.com"]
+domains = ["cool.com", "awesome.com", "example.net"]
 
 [server]
 listen = "0.0.0.0:2222"
@@ -23,3 +23,9 @@ ssh_keys = [
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFm9H4u1gYp8lYgFzR2l4Y7l1xJm6sS8b3Gx2r0P9QfW bob@desktop",
 ]
 domains = ["awesome.com"]
+
+[users.carol]
+ssh_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIxKIEUSIBzJ+gHEGHS4ZvtxvP4p8lgnqvx4KpGIIUL4 carol@phone",
+]
+addresses = ["carol@example.net", "info@example.net"]

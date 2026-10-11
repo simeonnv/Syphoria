@@ -12,6 +12,18 @@ pub enum ConfigError {
     UnknownDomain(String),
     #[error("ssh key {0} is assigned to more than one user")]
     DuplicateKey(String),
+    #[error("user `{0}` sets both `domains` and `addresses`, use one")]
+    BothGrants(String),
+    #[error("user `{0}` needs either `domains` or `addresses`")]
+    NoGrant(String),
+    #[error("address `{0}` is assigned to more than one user")]
+    DuplicateAddress(String),
+    #[error("address `{address}` is on `{domain}`, where user `{user}` can create addresses")]
+    ClaimedDomain {
+        address: String,
+        domain: String,
+        user: String,
+    },
     #[error("failed to read stalwart admin password")]
     AdminPassword,
     #[error("failed to set up vault")]
@@ -134,6 +146,8 @@ pub enum InputError {
     InvalidRecipient(String),
     #[error("add at least one recipient")]
     NoRecipients,
+    #[error("your addresses are fixed by the admin")]
+    FixedAddresses,
     #[error("unknown folder `{0}`")]
     UnknownFolder(String),
 }

@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use email_address::{EmailAddress, Options};
 use exn::ResultExt;
 use fqdn::FQDN;
 use russh::keys::PublicKey;
@@ -55,8 +56,55 @@ pub struct VaultConfig {
 pub struct UserConfig {
     #[serde_as(as = "Vec<DisplayFromStr>")]
     pub ssh_keys: Vec<PublicKey>,
-    #[serde_as(as = "SetPreventDuplicates<_>")]
-    pub domains: BTreeSet<FQDN>,
+    #[serde_as(as = "Option<SetPreventDuplicates<_>>")]
+    #[serde(default)]
+    pub domains: Option<BTreeSet<FQDN>>,
+    #[serde_as(as = "Option<SetPreventDuplicates<_>>")]
+    #[serde(default)]
+    pub addresses: Option<BTreeSet<Email>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Email {
+    address: String,
+    domain: FQDN,
+}
+
+impl Email {
+    pub fn as_str(&self) -> &str {
+        &self.address
+    }
+
+    pub fn domain(&self) -> &FQDN {
+        &self.domain
+    }
+}
+
+impl TryFrom<String> for Email {
+    type Error = String;
+
+    fn try_from(address: String) -> Result<Self, Self::Error> {
+        let options = Options::default()
+            .without_display_text()
+            .without_domain_literal();
+        let email = EmailAddress::parse_with_options(&address, options)
+            .map_err(|e| format!("invalid address `{address}`: {e}"))?;
+        let domain = email
+            .domain()
+            .parse()
+            .map_err(|e| format!("invalid domain in `{address}`: {e}"))?;
+        Ok(Self {
+            address: address.to_lowercase(),
+            domain,
+        })
+    }
+}
+
+impl fmt::Display for Email {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.address)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
