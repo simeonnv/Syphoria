@@ -10,15 +10,15 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use ratatui_textarea::TextArea;
-use termwiz::input::Modifiers;
 use zeroize::Zeroizing;
 
 use super::{
-    Action, Ctx, Load, Mode, View, alt, contains, ctrl, cycle, failure, find_match, keys_popup,
-    line_input, pick, status, table_nav, yank,
+    Action, Ctx, Load, Mode, View, confirm_popup, contains, cycle, failure, find_match,
+    keys::{self, Key},
+    line_input, pick, status, table_nav, theme, yank,
 };
 use crate::{
-    app::{KeyCode, KeyEvent},
+    app::KeyEvent,
     error::UiError,
     task::Task,
     vault::{Account, Db},
@@ -53,10 +53,10 @@ impl Secret {
     }
 
     fn input(&mut self, key: &KeyEvent) {
-        match key.key {
-            KeyCode::Char('u') if ctrl(key) => self.0.clear(),
-            KeyCode::Char(c) if !ctrl(key) && !alt(key) => self.0.push(c),
-            KeyCode::Backspace => {
+        match Key::new(key) {
+            Some(Key::Ctrl('u')) => self.0.clear(),
+            Some(Key::Char(c)) => self.0.push(c),
+            Some(Key::Backspace) => {
                 self.0.pop();
             }
             _ => {}
@@ -135,7 +135,7 @@ impl View for Accounts {
                 attempt,
                 error,
             } => {
-                frame.render_widget(Block::bordered().title(" Accounts "), area);
+                frame.render_widget(theme::block().title(" Accounts "), area);
                 let label = match (*setup, first.is_some()) {
                     (false, _) => "vault password",
                     (true, false) => "choose a vault password",
@@ -150,12 +150,14 @@ impl View for Accounts {
                     Line::from(""),
                 ];
                 match (attempt.poll(), error) {
-                    (Task::Running(_), _) => lines.push(Line::from("checking…").dim()),
+                    (Task::Running(_), _) => lines.push(Line::from("checking…").fg(theme::SUBTLE)),
                     (_, Some(error)) => lines.push(Line::from(failure(error)).red()),
                     _ => {}
                 }
                 if *setup {
-                    lines.push(Line::from("a forgotten password cannot be recovered").dim());
+                    lines.push(
+                        Line::from("a forgotten password cannot be recovered").fg(theme::SUBTLE),
+                    );
                 }
 
                 let width = 56.min(area.width);
@@ -185,12 +187,15 @@ impl View for Accounts {
                 confirm,
                 ..
             } => {
-                let block = Block::bordered().title(" Accounts ");
+                let block = theme::block().title(" Accounts ");
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
                 match list.poll() {
                     Task::Done(Ok(list)) if list.is_empty() => {
-                        frame.render_widget(Line::from("no accounts yet, press a").dim(), inner);
+                        frame.render_widget(
+                            Line::from("no accounts yet, press a").fg(theme::SUBTLE),
+                            inner,
+                        );
                     }
                     Task::Done(Ok(list)) => {
                         let rows = list.iter().map(|a| {
@@ -212,20 +217,15 @@ impl View for Accounts {
                         )
                         .header(
                             Row::new(["service", "username", "address", "url"])
-                                .style(Style::new().dim()),
+                                .style(theme::HEADER),
                         )
-                        .row_highlight_style(Style::new().reversed());
+                        .row_highlight_style(theme::SELECTED);
                         frame.render_stateful_widget(widget, inner, table);
                     }
                     other => status(frame, inner, other),
                 }
                 if confirm.is_some() {
-                    keys_popup(
-                        frame,
-                        area,
-                        " delete account? ",
-                        &[("y", "yes"), ("any", "cancel")],
-                    );
+                    confirm_popup(frame, area, " delete account? ");
                 }
             }
         }
@@ -243,9 +243,10 @@ impl View for Accounts {
                 if matches!(attempt, Task::Running(_)) {
                     return Action::None;
                 }
-                match key.key {
-                    KeyCode::Escape => return Action::Pop,
-                    KeyCode::Enter => {
+                match keys::Unlock::get(&key) {
+                    Some(keys::Unlock::Back) => return Action::Pop,
+                    Some(keys::Unlock::Clear) => *password = Secret::new(),
+                    Some(keys::Unlock::Submit) => {
                         *error = None;
                         let typed = password.take();
                         let (state, user) = (ctx.state, ctx.user);
@@ -275,7 +276,7 @@ impl View for Accounts {
                             *first = Some(typed);
                         }
                     }
-                    _ => password.input(&key),
+                    None => password.input(&key),
                 }
             }
             State::Unlocked {
@@ -285,7 +286,7 @@ impl View for Accounts {
                 confirm,
             } => {
                 if let Some(account) = confirm.take() {
-                    if key.key == KeyCode::Char('y') {
+                    if keys::Confirm::get(&key) == Some(keys::Confirm::Yes) {
                         let db = db.clone();
                         *list = Task::new_spawn(async move {
                             db.delete(&account)
@@ -299,46 +300,48 @@ impl View for Accounts {
                 if table_nav(table, &key) {
                     return Action::None;
                 }
-                match key.key {
-                    KeyCode::Escape => return Action::Pop,
-                    KeyCode::Char('r') => *list = load(db),
-                    KeyCode::Char('a') => {
+                let Some(cmd) = keys::Vault::get(&key) else {
+                    return Action::None;
+                };
+                match (cmd, selected(list, table)) {
+                    (keys::Vault::Back, _) => return Action::Pop,
+                    (keys::Vault::Reload, _) => *list = load(db),
+                    (keys::Vault::Add, _) => {
                         return Action::Push(Box::new(
                             AccountForm::new(ctx, db.clone(), None).into(),
                         ));
                     }
-                    _ => {}
-                }
-                let Some(account) = selected(list, table) else {
-                    return Action::None;
-                };
-                match key.key {
-                    KeyCode::Enter => {
+                    (keys::Vault::Show, Some(account)) => {
                         return Action::Push(Box::new(
                             AccountView::new(db.clone(), account.clone()).into(),
                         ));
                     }
-                    KeyCode::Char('e') => {
+                    (keys::Vault::Edit, Some(account)) => {
                         return Action::Push(Box::new(
                             AccountForm::new(ctx, db.clone(), Some(account.clone())).into(),
                         ));
                     }
-                    KeyCode::Char('d') => *confirm = Some(account.clone()),
-                    KeyCode::Char('y') if alt(&key) => return yank(&account.username),
-                    KeyCode::Char('y') => return yank(&account.password),
-                    _ => {}
+                    (keys::Vault::Delete, Some(account)) => *confirm = Some(account.clone()),
+                    (keys::Vault::YankPassword, Some(account)) => return yank(&account.password),
+                    (keys::Vault::YankUsername, Some(account)) => return yank(&account.username),
+                    (
+                        keys::Vault::Show
+                        | keys::Vault::Edit
+                        | keys::Vault::Delete
+                        | keys::Vault::YankPassword
+                        | keys::Vault::YankUsername,
+                        None,
+                    ) => {}
                 }
             }
         }
         Action::None
     }
 
-    fn help(&self) -> &'static str {
+    fn help(&self) -> keys::Help {
         match self.state {
-            State::Locked { .. } => "enter submit · ctrl-u clear · esc back",
-            State::Unlocked { .. } => {
-                "enter show · a add · e edit · d delete · y password · alt-y username · r reload"
-            }
+            State::Locked { .. } => &[keys::Unlock::KEYS],
+            State::Unlocked { .. } => &[keys::Vault::KEYS],
         }
     }
 
@@ -415,7 +418,10 @@ impl View for AccountView {
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let a = &self.account;
         let field = |name: &'static str, value: &str| {
-            Line::from(vec![Span::raw(name).dim(), Span::raw(value.to_owned())])
+            Line::from(vec![
+                Span::raw(name).fg(theme::SUBTLE),
+                Span::raw(value.to_owned()),
+            ])
         };
         let mut lines = vec![
             field("service:  ", &a.service),
@@ -429,25 +435,25 @@ impl View for AccountView {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(Block::bordered().title(format!(" {} ", a.service))),
+                .block(theme::block().title(format!(" {} ", a.service))),
             area,
         );
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
-        match key.key {
-            KeyCode::Escape => Action::Pop,
-            KeyCode::Char('y') if alt(&key) => yank(&self.account.username),
-            KeyCode::Char('y') => yank(&self.account.password),
-            KeyCode::Char('e') => Action::Push(Box::new(
+        match keys::Account::get(&key) {
+            Some(keys::Account::Back) => Action::Pop,
+            Some(keys::Account::YankPassword) => yank(&self.account.password),
+            Some(keys::Account::YankUsername) => yank(&self.account.username),
+            Some(keys::Account::Edit) => Action::Push(Box::new(
                 AccountForm::new(ctx, self.db.clone(), Some(self.account.clone())).into(),
             )),
-            _ => Action::None,
+            None => Action::None,
         }
     }
 
-    fn help(&self) -> &'static str {
-        "y password · alt-y username · e edit · esc back"
+    fn help(&self) -> keys::Help {
+        &[keys::Account::KEYS]
     }
 
     fn resume(&mut self, _ctx: &Ctx) -> Action {
@@ -575,6 +581,17 @@ impl AccountForm {
             .spawn(async move { db.save(account).await.or_raise(|| UiError::SaveAccount) });
     }
 
+    fn yank_field(&self) -> Action {
+        match self.focus {
+            Field::Service => yank(&self.service.lines().join("\n")),
+            Field::Address => yank(self.address().map_or("", String::as_str)),
+            Field::Username => yank(&self.username.lines().join("\n")),
+            Field::Password => yank(&self.password.0),
+            Field::Url => yank(&self.url.lines().join("\n")),
+            Field::Notes => yank(&self.notes.lines().join("\n")),
+        }
+    }
+
     fn field(&mut self) -> Option<&mut TextArea<'static>> {
         match self.focus {
             Field::Service => Some(&mut self.service),
@@ -601,7 +618,7 @@ impl View for AccountForm {
 
         let (focus, mode) = (self.focus, self.mode);
         let block = |title: &'static str, field: Field| {
-            let block = Block::bordered().title(title);
+            let block = theme::block().title(title);
             match (field == focus, mode) {
                 (true, Mode::Insert) => block.border_style(Style::new().green()),
                 (true, Mode::Normal) => block.border_style(Style::new().yellow()),
@@ -616,7 +633,7 @@ impl View for AccountForm {
                 self.address().map(String::as_str).unwrap_or_default()
             )),
             Task::Done(Err(e)) => Line::from(failure(e)).red(),
-            _ => Line::from("loading…").dim(),
+            _ => Line::from("loading…").fg(theme::SUBTLE),
         };
         frame.render_widget(
             Paragraph::new(sender).block(block(" Address ", Field::Address)),
@@ -650,7 +667,7 @@ impl View for AccountForm {
 
         let line = match self.saving.poll() {
             Task::Unexecuted | Task::Done(Ok(())) => Line::from(""),
-            Task::Running(_) => Line::from("saving…").dim(),
+            Task::Running(_) => Line::from("saving…").fg(theme::SUBTLE),
             Task::Done(Err(e)) => Line::from(failure(e)).red(),
             Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         };
@@ -658,51 +675,67 @@ impl View for AccountForm {
     }
 
     fn input(&mut self, key: KeyEvent, _ctx: &Ctx) -> Action {
-        let shift = key.modifiers.contains(Modifiers::SHIFT);
-        match (self.mode, key.key) {
-            (_, KeyCode::Char('s')) if ctrl(&key) => self.save(),
-            (_, KeyCode::Char('r')) if ctrl(&key) => self.password = Secret::generate(),
-            (_, KeyCode::Tab) => self.focus = self.focus.step(!shift),
-            (_, KeyCode::LeftArrow | KeyCode::RightArrow) if self.focus == Field::Address => {
-                self.cycle_address(key.key == KeyCode::RightArrow);
+        let on_address = self.focus == Field::Address;
+        match keys::Fields::get(&key) {
+            Some(keys::Fields::Submit) => {
+                self.save();
+                return Action::None;
             }
-            (Mode::Insert, KeyCode::Escape) => self.mode = Mode::Normal,
-            (Mode::Insert, KeyCode::Enter) if self.focus != Field::Notes => {
+            Some(keys::Fields::Next) => {
                 self.focus = self.focus.step(true);
+                return Action::None;
             }
-            (Mode::Insert, _) if self.focus == Field::Password => self.password.input(&key),
-            (Mode::Insert, _) => {
-                if let Some(area) = self.field() {
-                    area.input(key);
-                }
-            }
-            (Mode::Normal, KeyCode::Escape) => return Action::Pop,
-            (Mode::Normal, KeyCode::Char('i')) if self.focus != Field::Address => {
-                self.mode = Mode::Insert;
-            }
-            (Mode::Normal, KeyCode::Char('j') | KeyCode::DownArrow) => {
-                self.focus = self.focus.step(true);
-            }
-            (Mode::Normal, KeyCode::Char('k') | KeyCode::UpArrow) => {
+            Some(keys::Fields::Prev) => {
                 self.focus = self.focus.step(false);
+                return Action::None;
             }
-            (Mode::Normal, KeyCode::Char(c @ ('h' | 'l'))) if self.focus == Field::Address => {
-                self.cycle_address(c == 'l');
+            Some(keys::Fields::Left) if on_address => {
+                self.cycle_address(false);
+                return Action::None;
             }
-            (Mode::Normal, KeyCode::Char('y')) if self.focus == Field::Password => {
-                return yank(&self.password.0);
+            Some(keys::Fields::Right) if on_address => {
+                self.cycle_address(true);
+                return Action::None;
             }
-            _ => {}
+            Some(keys::Fields::Left | keys::Fields::Right) | None => {}
+        }
+        if let Some(keys::Password::Generate) = keys::Password::get(&key) {
+            self.password = Secret::generate();
+            return Action::None;
+        }
+        match self.mode {
+            Mode::Insert => match keys::Insert::get(&key) {
+                Some(keys::Insert::Normal) => self.mode = Mode::Normal,
+                Some(keys::Insert::Next) if self.focus != Field::Notes => {
+                    self.focus = self.focus.step(true);
+                }
+                Some(keys::Insert::Next) | None if self.focus == Field::Password => {
+                    self.password.input(&key);
+                }
+                Some(keys::Insert::Next) | None => {
+                    if let Some(area) = self.field() {
+                        area.input(key);
+                    }
+                }
+            },
+            Mode::Normal => match keys::Edit::get(&key) {
+                Some(keys::Edit::Back) => return Action::Pop,
+                Some(keys::Edit::Insert) if !on_address => self.mode = Mode::Insert,
+                Some(keys::Edit::Down) => self.focus = self.focus.step(true),
+                Some(keys::Edit::Up) => self.focus = self.focus.step(false),
+                Some(keys::Edit::Left) if on_address => self.cycle_address(false),
+                Some(keys::Edit::Right) if on_address => self.cycle_address(true),
+                Some(keys::Edit::Yank) => return self.yank_field(),
+                Some(keys::Edit::Insert | keys::Edit::Left | keys::Edit::Right) | None => {}
+            },
         }
         Action::None
     }
 
-    fn help(&self) -> &'static str {
+    fn help(&self) -> keys::Help {
         match self.mode {
-            Mode::Normal => {
-                "i insert · j/k field · h/l address · ctrl-r generate · ctrl-s or :w save · esc back"
-            }
-            Mode::Insert => "esc normal · tab field · ctrl-r generate · ctrl-s save",
+            Mode::Normal => &[keys::Edit::KEYS, keys::Fields::KEYS, keys::Password::KEYS],
+            Mode::Insert => &[keys::Insert::KEYS, keys::Fields::KEYS, keys::Password::KEYS],
         }
     }
 

@@ -5,15 +5,15 @@ use ratatui::{
     layout::Rect,
     style::Stylize,
     text::{Line, Text},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 use super::{
-    Action, Compose, Ctx, Draft, Load, MOVE, Op, PAGE, View, alt, date, emails, failure,
-    keys_popup, move_target, status, yank,
+    Action, Compose, Ctx, Draft, Load, Op, PAGE, View, confirm_popup, date, emails, failure,
+    junk_target, keys, keys_popup, move_target, status, theme, yank,
 };
 use crate::{
-    app::{KeyCode, KeyEvent},
+    app::KeyEvent,
     error::UiError,
     mail::{Addr, Message},
     task::Task,
@@ -26,6 +26,7 @@ enum Pending {
 
 pub struct Reader {
     id: String,
+    role: Role,
     message: Load<Message>,
     scroll: u16,
     op: Load<()>,
@@ -33,11 +34,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(ctx: &Ctx, id: String) -> Self {
+    pub fn new(ctx: &Ctx, id: String, role: Role) -> Self {
         let mail = ctx.mail.clone();
         let message_id = id.clone();
         Self {
             id,
+            role,
             message: Task::new_spawn(async move {
                 mail.message(&message_id)
                     .await
@@ -57,6 +59,40 @@ impl Reader {
         self.op.spawn(async move { op.run(&mail, &id).await });
     }
 
+    fn move_to(&mut self, ctx: &Ctx, to: Role) {
+        if to != self.role {
+            let from = self.role.clone();
+            self.run(ctx, Op::Move { from, to });
+        }
+    }
+
+    fn mail(&mut self, cmd: keys::Mail, ctx: &Ctx) -> Action {
+        let message = match &self.message {
+            Task::Done(Ok(message)) => Some(message),
+            _ => None,
+        };
+        match cmd {
+            keys::Mail::Back => return Action::Pop,
+            keys::Mail::Trash => self.move_to(ctx, Role::Trash),
+            keys::Mail::Archive => self.move_to(ctx, Role::Archive),
+            keys::Mail::Junk => self.move_to(ctx, junk_target(&self.role)),
+            keys::Mail::Delete => self.pending = Some(Pending::Destroy),
+            keys::Mail::Move => self.pending = Some(Pending::Move),
+            keys::Mail::Unread => self.run(ctx, Op::Seen(false)),
+            keys::Mail::YankSender => {
+                if let Some(message) = message {
+                    return yank(&emails(&message.from));
+                }
+            }
+            keys::Mail::YankSubject => {
+                if let Some(message) = message {
+                    return yank(&message.subject);
+                }
+            }
+        }
+        Action::None
+    }
+
     fn lines(&self) -> u16 {
         match &self.message {
             Task::Done(Ok(message)) => (message.body.lines().count() + 5) as u16,
@@ -67,9 +103,11 @@ impl Reader {
 
 impl View for Reader {
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let mut block = Block::bordered();
+        let mut block = theme::block();
         match self.op.poll() {
-            Task::Running(_) => block = block.title_bottom(Line::from(" working… ").dim()),
+            Task::Running(_) => {
+                block = block.title_bottom(Line::from(" working… ").fg(theme::SUBTLE))
+            }
             Task::Done(Err(e)) => {
                 block = block.title_bottom(Line::from(format!(" {} ", failure(e))).red());
             }
@@ -83,7 +121,9 @@ impl View for Reader {
             return;
         };
 
-        let header = |name: &'static str, value: String| Line::from(vec![name.dim(), value.into()]);
+        let header = |name: &'static str, value: String| {
+            Line::from(vec![name.fg(theme::SUBTLE), value.into()])
+        };
         let mut text = Text::from(vec![
             header("from:    ", list(&message.from)),
             header("to:      ", list(&message.to)),
@@ -105,13 +145,8 @@ impl View for Reader {
         );
 
         match self.pending {
-            Some(Pending::Move) => keys_popup(frame, area, " move to ", MOVE),
-            Some(Pending::Destroy) => keys_popup(
-                frame,
-                area,
-                " delete permanently? ",
-                &[("y", "yes"), ("any", "cancel")],
-            ),
+            Some(Pending::Move) => keys_popup(frame, area, " move to ", &[keys::MoveTo::KEYS]),
+            Some(Pending::Destroy) => confirm_popup(frame, area, " delete permanently? "),
             None => {}
         }
     }
@@ -120,12 +155,12 @@ impl View for Reader {
         if let Some(pending) = self.pending.take() {
             match pending {
                 Pending::Move => {
-                    if let Some(op) = move_target(&key) {
-                        self.run(ctx, op);
+                    if let Some(to) = move_target(&key) {
+                        self.move_to(ctx, to);
                     }
                 }
                 Pending::Destroy => {
-                    if key.key == KeyCode::Char('y') {
+                    if keys::Confirm::get(&key) == Some(keys::Confirm::Yes) {
                         self.run(ctx, Op::Destroy);
                     }
                 }
@@ -133,58 +168,40 @@ impl View for Reader {
             return Action::None;
         }
 
-        let message = match &self.message {
-            Task::Done(Ok(message)) => Some(message),
-            _ => None,
-        };
-        match key.key {
-            KeyCode::Char('j') | KeyCode::DownArrow => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Char('k') | KeyCode::UpArrow => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(PAGE),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(PAGE),
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.lines(),
-            KeyCode::Escape => return Action::Pop,
-            KeyCode::Char('d') if alt(&key) => self.pending = Some(Pending::Destroy),
-            KeyCode::Char('d') => self.run(ctx, Op::Move(Role::Trash)),
-            KeyCode::Char('m') => self.pending = Some(Pending::Move),
-            KeyCode::Char('u') => self.run(ctx, Op::Seen(false)),
-            KeyCode::Char('r') => {
-                if let Some(message) = message {
-                    return Action::Push(Box::new(
-                        Compose::new(ctx, reply(ctx, message, false)).into(),
-                    ));
-                }
-            }
-            KeyCode::Char('R') => {
-                if let Some(message) = message {
-                    return Action::Push(Box::new(
-                        Compose::new(ctx, reply(ctx, message, true)).into(),
-                    ));
-                }
-            }
-            KeyCode::Char('f') => {
-                if let Some(message) = message {
-                    return Action::Push(Box::new(Compose::new(ctx, forward(ctx, message)).into()));
-                }
-            }
-            KeyCode::Char('y') if alt(&key) => {
-                if let Some(message) = message {
-                    return yank(&emails(&message.from));
-                }
-            }
-            KeyCode::Char('y') => {
-                if let Some(message) = message {
-                    return yank(&message.body);
-                }
-            }
-            _ => {}
+        if let Some(nav) = keys::Nav::get(&key) {
+            self.scroll = match nav {
+                keys::Nav::Down => self.scroll.saturating_add(1),
+                keys::Nav::Up => self.scroll.saturating_sub(1),
+                keys::Nav::PageDown => self.scroll.saturating_add(PAGE),
+                keys::Nav::PageUp => self.scroll.saturating_sub(PAGE),
+                keys::Nav::Top => 0,
+                keys::Nav::Bottom => self.lines(),
+            };
+            return Action::None;
         }
-        Action::None
+        if let Some(cmd) = keys::Mail::get(&key) {
+            return self.mail(cmd, ctx);
+        }
+        let Task::Done(Ok(message)) = &self.message else {
+            return Action::None;
+        };
+        match keys::Reader::get(&key) {
+            Some(keys::Reader::Reply) => Action::Push(Box::new(
+                Compose::new(ctx, reply(ctx, message, false)).into(),
+            )),
+            Some(keys::Reader::ReplyAll) => Action::Push(Box::new(
+                Compose::new(ctx, reply(ctx, message, true)).into(),
+            )),
+            Some(keys::Reader::Forward) => {
+                Action::Push(Box::new(Compose::new(ctx, forward(ctx, message)).into()))
+            }
+            Some(keys::Reader::YankBody) => yank(&message.body),
+            None => Action::None,
+        }
     }
 
-    fn help(&self) -> &'static str {
-        "r reply · R reply all · f forward · d trash · alt-d delete · m move · u unread · y body · alt-y sender"
+    fn help(&self) -> keys::Help {
+        &[keys::Reader::KEYS, keys::Mail::KEYS]
     }
 
     fn update(&mut self, _ctx: &Ctx) -> Action {

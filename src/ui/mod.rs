@@ -1,8 +1,10 @@
 mod accounts;
 mod addresses;
 mod compose;
+mod keys;
 mod messages;
 mod reader;
+mod theme;
 
 use std::{error::Error, sync::Arc};
 
@@ -15,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, TableState, Wrap},
+    widgets::{Clear, List, ListItem, ListState, Paragraph, TableState, Wrap},
 };
 use ratatui_textarea::{CursorMove, TextArea};
 use termwiz::input::Modifiers;
@@ -41,39 +43,6 @@ type Load<T> = Task<exn::Result<T, UiError>>;
 const SIDEBAR_WIDTH: u16 = 28;
 const REFRESH_TICKS: u32 = 50;
 const PAGE: u16 = 20;
-
-const GOTO: &[(&str, &str)] = &[
-    ("g", "first item"),
-    ("e", "last item"),
-    ("i", "inbox"),
-    ("d", "drafts"),
-    ("s", "sent"),
-    ("a", "archive"),
-    ("j", "junk"),
-    ("t", "trash"),
-    ("n", "next sidebar entry"),
-    ("p", "previous sidebar entry"),
-];
-
-const SPACE: &[(&str, &str)] = &[
-    ("c", "compose"),
-    ("a", "addresses"),
-    ("v", "vault"),
-    ("l", "lock vault"),
-    ("?", "keymap"),
-];
-
-const GLOBAL: &[(&str, &str)] = &[
-    (":", "command"),
-    ("/", "search"),
-    ("n / N", "next / previous match"),
-    ("g", "goto"),
-    ("space", "space menu"),
-    ("i", "insert mode"),
-    ("esc", "normal mode / back"),
-    ("pgup/pgdn", "scroll a page"),
-    ("alt-↑/↓", "sidebar"),
-];
 
 const COMMANDS: &[(&str, &str)] = &[
     (":q  :quit", "quit"),
@@ -106,7 +75,15 @@ pub enum Action {
 
 #[derive(Clone)]
 pub enum Op {
-    Move(Role),
+    Move {
+        from: Role,
+        to: Role,
+    },
+    Undo {
+        mailbox: String,
+        from: Role,
+        to: Role,
+    },
     Destroy,
     Seen(bool),
 }
@@ -114,8 +91,12 @@ pub enum Op {
 impl Op {
     async fn run(self, mail: &Mail, id: &str) -> exn::Result<(), UiError> {
         match self {
-            Op::Move(role) => mail
-                .move_to(id, role.clone())
+            Op::Move { from, to } => mail
+                .move_to(id, &from, &to)
+                .await
+                .or_raise(|| UiError::MoveMessage),
+            Op::Undo { mailbox, from, to } => mail
+                .move_into(id, &mailbox, &from, &to)
                 .await
                 .or_raise(|| UiError::MoveMessage),
             Op::Destroy => mail.destroy(id).await.or_raise(|| UiError::DeleteMessage),
@@ -127,29 +108,27 @@ impl Op {
     }
 }
 
-const MOVE: &[(&str, &str)] = &[
-    ("i", "inbox"),
-    ("a", "archive"),
-    ("j", "junk"),
-    ("t", "trash"),
-];
+fn move_target(key: &KeyEvent) -> Option<Role> {
+    keys::MoveTo::get(key).map(|target| match target {
+        keys::MoveTo::Inbox => Role::Inbox,
+        keys::MoveTo::Archive => Role::Archive,
+        keys::MoveTo::Junk => Role::Junk,
+        keys::MoveTo::Trash => Role::Trash,
+    })
+}
 
-fn move_target(key: &KeyEvent) -> Option<Op> {
-    let role = match key.key {
-        KeyCode::Char('i') => Role::Inbox,
-        KeyCode::Char('a') => Role::Archive,
-        KeyCode::Char('j') => Role::Junk,
-        KeyCode::Char('t') => Role::Trash,
-        _ => return None,
-    };
-    Some(Op::Move(role))
+fn junk_target(role: &Role) -> Role {
+    match role {
+        Role::Junk | Role::Trash | Role::Archive => Role::Inbox,
+        _ => Role::Junk,
+    }
 }
 
 #[enum_dispatch]
 pub trait View {
     fn draw(&mut self, frame: &mut Frame, area: Rect);
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action;
-    fn help(&self) -> &'static str;
+    fn help(&self) -> keys::Help;
     fn mode(&self) -> Mode {
         Mode::Normal
     }
@@ -178,7 +157,11 @@ pub enum Page {
 
 #[derive(Clone, PartialEq, Eq)]
 enum Nav {
-    Folder { id: String, name: String },
+    Folder {
+        id: String,
+        name: String,
+        role: Role,
+    },
     Compose,
     Addresses,
     Accounts,
@@ -187,7 +170,9 @@ enum Nav {
 impl Nav {
     fn open(&self, ctx: &Ctx) -> Page {
         match self {
-            Nav::Folder { id, name } => Messages::new(ctx, name.clone(), id.clone()).into(),
+            Nav::Folder { id, name, role } => {
+                Messages::new(ctx, name.clone(), id.clone(), role.clone()).into()
+            }
             Nav::Compose => Compose::new(ctx, Draft::default()).into(),
             Nav::Addresses => Addresses::new(ctx).into(),
             Nav::Accounts => Accounts::new(ctx).into(),
@@ -270,6 +255,7 @@ impl Session {
             .map(|f| Nav::Folder {
                 id: f.id.clone(),
                 name: f.name.clone(),
+                role: f.role.clone(),
             })
             .chain([Nav::Compose, Nav::Addresses, Nav::Accounts])
             .collect()
@@ -287,6 +273,7 @@ impl Session {
             Some(f) => self.go(Nav::Folder {
                 id: f.id.clone(),
                 name: f.name.clone(),
+                role: f.role.clone(),
             }),
             None => self.notice = Some(Notice::Error(format!("no {role:?} folder"))),
         }
@@ -367,10 +354,8 @@ impl Session {
             return;
         }
         self.notice = None;
-        if key.modifiers.contains(Modifiers::ALT)
-            && matches!(key.key, KeyCode::UpArrow | KeyCode::DownArrow)
-        {
-            self.step(key.key == KeyCode::DownArrow);
+        if let Some(sidebar) = keys::Always::get(&key) {
+            self.step(sidebar == keys::Always::SidebarNext);
             return;
         }
         if self.mode() == Mode::Insert {
@@ -381,45 +366,50 @@ impl Session {
             self.prefixed(prefix, key);
             return;
         }
-        match key.key {
-            KeyCode::Char(':') => self.open_prompt(PromptKind::Command),
-            KeyCode::Char('/') => self.open_prompt(PromptKind::Search),
-            KeyCode::Char('g') => self.pending = Some(Prefix::Goto),
-            KeyCode::Char(' ') => self.pending = Some(Prefix::Space),
-            KeyCode::Char(c @ ('n' | 'N')) if self.search.is_some() => {
-                if let (Some(query), Some(page)) = (&self.search, self.stack.last_mut()) {
-                    page.search(query, c == 'n');
-                }
-            }
-            _ => self.send(key),
+        match keys::Global::get(&key) {
+            Some(keys::Global::Command) => self.open_prompt(PromptKind::Command),
+            Some(keys::Global::Search) => self.open_prompt(PromptKind::Search),
+            Some(keys::Global::Goto) => self.pending = Some(Prefix::Goto),
+            Some(keys::Global::Space) => self.pending = Some(Prefix::Space),
+            Some(keys::Global::NextMatch) => self.find(true),
+            Some(keys::Global::PrevMatch) => self.find(false),
+            None => self.send(key),
+        }
+    }
+
+    fn find(&mut self, forward: bool) {
+        if let (Some(query), Some(page)) = (&self.search, self.stack.last_mut()) {
+            page.search(query, forward);
         }
     }
 
     fn prefixed(&mut self, prefix: Prefix, key: KeyEvent) {
-        let KeyCode::Char(c) = key.key else {
-            return;
-        };
         let press = |key| KeyEvent {
             key,
             modifiers: Modifiers::NONE,
         };
-        match (prefix, c) {
-            (Prefix::Goto, 'g') => self.send(press(KeyCode::Home)),
-            (Prefix::Goto, 'e') => self.send(press(KeyCode::End)),
-            (Prefix::Goto, 'i') => self.goto_role(Role::Inbox),
-            (Prefix::Goto, 'd') => self.goto_role(Role::Drafts),
-            (Prefix::Goto, 's') => self.goto_role(Role::Sent),
-            (Prefix::Goto, 'a') => self.goto_role(Role::Archive),
-            (Prefix::Goto, 'j') => self.goto_role(Role::Junk),
-            (Prefix::Goto, 't') => self.goto_role(Role::Trash),
-            (Prefix::Goto, 'n') => self.step(true),
-            (Prefix::Goto, 'p') => self.step(false),
-            (Prefix::Space, 'c') => self.go(Nav::Compose),
-            (Prefix::Space, 'a') => self.go(Nav::Addresses),
-            (Prefix::Space, 'v') => self.go(Nav::Accounts),
-            (Prefix::Space, 'l') => self.lock(),
-            (Prefix::Space, '?') => self.help = true,
-            _ => {}
+        match prefix {
+            Prefix::Goto => match keys::Goto::get(&key) {
+                Some(keys::Goto::Top) => self.send(press(KeyCode::Home)),
+                Some(keys::Goto::Bottom) => self.send(press(KeyCode::End)),
+                Some(keys::Goto::Inbox) => self.goto_role(Role::Inbox),
+                Some(keys::Goto::Drafts) => self.goto_role(Role::Drafts),
+                Some(keys::Goto::Sent) => self.goto_role(Role::Sent),
+                Some(keys::Goto::Archive) => self.goto_role(Role::Archive),
+                Some(keys::Goto::Junk) => self.goto_role(Role::Junk),
+                Some(keys::Goto::Trash) => self.goto_role(Role::Trash),
+                Some(keys::Goto::Next) => self.step(true),
+                Some(keys::Goto::Prev) => self.step(false),
+                None => {}
+            },
+            Prefix::Space => match keys::Space::get(&key) {
+                Some(keys::Space::Compose) => self.go(Nav::Compose),
+                Some(keys::Space::Addresses) => self.go(Nav::Addresses),
+                Some(keys::Space::Vault) => self.go(Nav::Accounts),
+                Some(keys::Space::Lock) => self.lock(),
+                Some(keys::Space::Help) => self.help = true,
+                None => {}
+            },
         }
     }
 
@@ -434,10 +424,10 @@ impl Session {
         let Some(prompt) = &mut self.prompt else {
             return;
         };
-        match key.key {
-            KeyCode::Escape => self.prompt = None,
-            KeyCode::Backspace if prompt.input.is_empty() => self.prompt = None,
-            KeyCode::Enter => {
+        match keys::Prompt::get(&key) {
+            Some(keys::Prompt::Cancel) => self.prompt = None,
+            Some(keys::Prompt::Erase) if prompt.input.is_empty() => self.prompt = None,
+            Some(keys::Prompt::Submit) => {
                 let text = prompt.input.lines().join("");
                 let kind = prompt.kind;
                 self.prompt = None;
@@ -452,7 +442,7 @@ impl Session {
                     PromptKind::Search => {}
                 }
             }
-            _ => {
+            Some(keys::Prompt::Erase) | None => {
                 prompt.input.input(key);
             }
         }
@@ -489,7 +479,7 @@ impl Session {
             self.refresh = Task::new();
         }
 
-        let block = Block::bordered().title(format!(" {} ", self.ctx.user.name));
+        let block = theme::block().title(format!(" {} ", self.ctx.user.name));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -505,11 +495,14 @@ impl Session {
             }
             ListItem::new(Line::from(spans))
         });
-        let divider = ListItem::new("─".repeat(inner.width as usize)).dim();
+        let divider = ListItem::new("─".repeat(inner.width as usize)).fg(theme::SUBTLE);
         let accounts = if self.ctx.vault.is_some() {
             Line::from("Accounts")
         } else {
-            Line::from(vec![Span::raw("Accounts"), Span::raw(" locked").dim()])
+            Line::from(vec![
+                Span::raw("Accounts"),
+                Span::raw(" locked").fg(theme::SUBTLE),
+            ])
         };
         let items: Vec<ListItem> = folders
             .chain([
@@ -524,7 +517,7 @@ impl Session {
         let selected = position.map(|i| if i >= self.folders.len() { i + 1 } else { i });
         let mut state = ListState::default().with_selected(selected);
         frame.render_stateful_widget(
-            List::new(items).highlight_style(Style::new().reversed()),
+            List::new(items).highlight_style(theme::SELECTED),
             inner,
             &mut state,
         );
@@ -560,32 +553,40 @@ impl Session {
             Constraint::Length(right.width() as u16 + 1),
         ])
         .areas(area);
-        let help = self.stack.last().map_or("", View::help);
+        let help = self.stack.last().map_or(&[][..], View::help);
         frame.render_widget(
-            Line::from(vec![mode, Span::raw(" "), Span::raw(help).dim()]),
+            Line::from(vec![
+                mode,
+                Span::raw(" "),
+                Span::raw(keys::line(help)).fg(theme::SUBTLE),
+            ]),
             left,
         );
         frame.render_widget(Line::from(right), notice);
     }
 
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let section = |title: &'static str, keys: &[(&str, &'static str)]| {
-            let mut lines = vec![Line::from(title).bold()];
-            lines.extend(keys.iter().map(|(key, desc)| key_line(key, desc)));
-            lines.push(Line::from(""));
-            lines
+        let section = |title: &'static str, mut body: Vec<Line<'static>>| {
+            body.insert(0, Line::from(title).bold());
+            body.push(Line::from(""));
+            body
         };
-        let mut lines = section("global", GLOBAL);
-        lines.extend(section("goto (g)", GOTO));
-        lines.extend(section("space", SPACE));
-        lines.extend(section("commands", COMMANDS));
+        let mut lines = section(
+            "global",
+            bind_lines(&[keys::Global::KEYS, keys::Always::KEYS]),
+        );
+        lines.extend(section("goto (g)", bind_lines(&[keys::Goto::KEYS])));
+        lines.extend(section("space", bind_lines(&[keys::Space::KEYS])));
+        lines.extend(section(
+            "commands",
+            COMMANDS
+                .iter()
+                .map(|(name, desc)| key_line(name, desc))
+                .collect(),
+        ));
         lines.push(Line::from("this page").bold());
         if let Some(page) = self.stack.last() {
-            lines.extend(
-                page.help()
-                    .split(" · ")
-                    .map(|h| Line::from(format!("  {h}"))),
-            );
+            lines.extend(bind_lines(page.help()));
         }
 
         let width = 48.min(area.width);
@@ -598,7 +599,7 @@ impl Session {
         };
         frame.render_widget(Clear, rect);
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" keymap · any key closes ")),
+            Paragraph::new(lines).block(theme::block().title(" keymap · any key closes ")),
             rect,
         );
     }
@@ -615,8 +616,8 @@ impl Session {
         }
         self.draw_status(frame, footer);
         match self.pending {
-            Some(Prefix::Goto) => keys_popup(frame, body, " goto ", GOTO),
-            Some(Prefix::Space) => keys_popup(frame, body, " space ", SPACE),
+            Some(Prefix::Goto) => keys_popup(frame, body, " goto ", &[keys::Goto::KEYS]),
+            Some(Prefix::Space) => keys_popup(frame, body, " space ", &[keys::Space::KEYS]),
             None => {}
         }
         if self.help {
@@ -681,7 +682,11 @@ impl App for Pages {
                             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
                                 .areas(frame.area());
                         status(frame, body, self.connecting.poll());
-                        frame.render_widget(Line::from(" q quit").dim(), footer);
+                        frame.render_widget(
+                            Line::from(format!(" {}", keys::line(&[keys::Connecting::KEYS])))
+                                .fg(theme::SUBTLE),
+                            footer,
+                        );
                     })
                     .or_raise(|| UiError::Draw)?;
             }
@@ -695,7 +700,7 @@ impl App for Pages {
         };
         match &mut self.session {
             Some(session) => session.input(key),
-            None => self.exit = matches!(key.key, KeyCode::Char('q') | KeyCode::Escape),
+            None => self.exit = keys::Connecting::get(&key) == Some(keys::Connecting::Quit),
         }
     }
 
@@ -713,6 +718,7 @@ fn inbox(ctx: &Ctx) -> Nav {
     Nav::Folder {
         id: ctx.mail.inbox.clone(),
         name: "Inbox".into(),
+        role: Role::Inbox,
     }
 }
 
@@ -723,8 +729,24 @@ fn key_line(key: &str, desc: &'static str) -> Line<'static> {
     ])
 }
 
-fn keys_popup(frame: &mut Frame, area: Rect, title: &str, keys: &[(&str, &'static str)]) {
-    let lines: Vec<Line> = keys.iter().map(|(key, desc)| key_line(key, desc)).collect();
+fn bind_lines(help: keys::Help) -> Vec<Line<'static>> {
+    help.iter()
+        .flat_map(|binds| binds.iter())
+        .map(|bind| key_line(&bind.label(), bind.help))
+        .collect()
+}
+
+fn confirm_popup(frame: &mut Frame, area: Rect, title: &str) {
+    let mut lines = bind_lines(&[keys::Confirm::KEYS]);
+    lines.push(key_line("any", "cancel"));
+    lines_popup(frame, area, title, lines);
+}
+
+fn keys_popup(frame: &mut Frame, area: Rect, title: &str, help: keys::Help) {
+    lines_popup(frame, area, title, bind_lines(help));
+}
+
+fn lines_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
     let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4)
         .max(title.len() as u16 + 4)
         .min(area.width);
@@ -737,7 +759,7 @@ fn keys_popup(frame: &mut Frame, area: Rect, title: &str, keys: &[(&str, &'stati
     };
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title.to_owned())),
+        Paragraph::new(lines).block(theme::block().title(title.to_owned())),
         rect,
     );
 }
@@ -745,7 +767,7 @@ fn keys_popup(frame: &mut Frame, area: Rect, title: &str, keys: &[(&str, &'stati
 fn status<T>(frame: &mut Frame, area: Rect, task: &Load<T>) {
     let line = match task {
         Task::Done(Ok(_)) | Task::Unexecuted => return,
-        Task::Running(_) => Line::from("loading…").dim(),
+        Task::Running(_) => Line::from("loading…").fg(theme::SUBTLE),
         Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         Task::Done(Err(e)) => Line::from(failure(e)).red(),
     };
@@ -769,27 +791,31 @@ fn line_input(text: String) -> Box<TextArea<'static>> {
 }
 
 fn table_nav(table: &mut TableState, key: &KeyEvent) -> bool {
-    match key.key {
-        KeyCode::Char('j') | KeyCode::DownArrow => table.select_next(),
-        KeyCode::Char('k') | KeyCode::UpArrow => table.select_previous(),
-        KeyCode::Home => table.select_first(),
-        KeyCode::End => table.select_last(),
-        KeyCode::PageDown => table.scroll_down_by(PAGE),
-        KeyCode::PageUp => table.scroll_up_by(PAGE),
-        _ => return false,
+    let Some(nav) = keys::Nav::get(key) else {
+        return false;
+    };
+    match nav {
+        keys::Nav::Down => table.select_next(),
+        keys::Nav::Up => table.select_previous(),
+        keys::Nav::Top => table.select_first(),
+        keys::Nav::Bottom => table.select_last(),
+        keys::Nav::PageDown => table.scroll_down_by(PAGE),
+        keys::Nav::PageUp => table.scroll_up_by(PAGE),
     }
     true
 }
 
 fn list_nav(list: &mut ListState, key: &KeyEvent) -> bool {
-    match key.key {
-        KeyCode::Char('j') | KeyCode::DownArrow => list.select_next(),
-        KeyCode::Char('k') | KeyCode::UpArrow => list.select_previous(),
-        KeyCode::Home => list.select_first(),
-        KeyCode::End => list.select_last(),
-        KeyCode::PageDown => list.scroll_down_by(PAGE),
-        KeyCode::PageUp => list.scroll_up_by(PAGE),
-        _ => return false,
+    let Some(nav) = keys::Nav::get(key) else {
+        return false;
+    };
+    match nav {
+        keys::Nav::Down => list.select_next(),
+        keys::Nav::Up => list.select_previous(),
+        keys::Nav::Top => list.select_first(),
+        keys::Nav::Bottom => list.select_last(),
+        keys::Nav::PageDown => list.scroll_down_by(PAGE),
+        keys::Nav::PageUp => list.scroll_up_by(PAGE),
     }
     true
 }
@@ -856,12 +882,4 @@ fn emails(list: &[Addr]) -> String {
 
 fn yank(text: &str) -> Action {
     Action::Yank(Zeroizing::new(text.to_owned()))
-}
-
-fn alt(key: &KeyEvent) -> bool {
-    key.modifiers.contains(Modifiers::ALT)
-}
-
-fn ctrl(key: &KeyEvent) -> bool {
-    key.modifiers.contains(Modifiers::CTRL)
 }

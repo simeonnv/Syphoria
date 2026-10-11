@@ -13,6 +13,8 @@ use url::Url;
 use crate::error::RemoteError;
 
 const SEEN: &str = "$seen";
+const JUNK: &str = "$junk";
+const NOT_JUNK: &str = "$notjunk";
 const PAGE: usize = 200;
 
 pub struct Mail {
@@ -91,16 +93,33 @@ impl Mail {
         Ok(mail)
     }
 
-    pub async fn move_to(&self, id: &str, role: Role) -> Result<(), RemoteError> {
+    pub async fn move_to(&self, id: &str, from: &Role, to: &Role) -> Result<(), RemoteError> {
         let mailbox = self
             .mailboxes
             .iter()
-            .find(|(r, _)| *r == role)
+            .find(|(r, _)| r == to)
             .map(|(_, mailbox)| mailbox.as_str())
-            .ok_or_raise(|| RemoteError::NoMailbox(format!("{role:?}")))?;
-        self.client
-            .email_set_mailboxes(id, [mailbox])
+            .ok_or_raise(|| RemoteError::NoMailbox(format!("{to:?}")))?;
+        self.move_into(id, mailbox, from, to).await
+    }
+
+    pub async fn move_into(
+        &self,
+        id: &str,
+        mailbox: &str,
+        from: &Role,
+        to: &Role,
+    ) -> Result<(), RemoteError> {
+        let mut request = self.client.build();
+        let email = request.set_email().update(id).mailbox_ids([mailbox]);
+        if let Some(junk) = junk(from, to) {
+            email.keyword(JUNK, junk).keyword(NOT_JUNK, !junk);
+        }
+        request
+            .send_single::<EmailSetResponse>()
             .await
+            .map_err(RemoteError::jmap)?
+            .updated(id)
             .map_err(RemoteError::jmap)?;
         Ok(())
     }
@@ -335,6 +354,16 @@ fn rank(role: &Role) -> u8 {
         Role::Junk => 4,
         Role::Trash => 5,
         _ => 6,
+    }
+}
+
+fn junk(from: &Role, to: &Role) -> Option<bool> {
+    match (from, to) {
+        (Role::Junk, Role::Junk) => None,
+        (_, Role::Junk) => Some(true),
+        (Role::Junk, Role::Trash) => None,
+        (Role::Junk, _) => Some(false),
+        _ => None,
     }
 }
 

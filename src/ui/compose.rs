@@ -7,14 +7,13 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::Line,
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
 };
 use ratatui_textarea::TextArea;
-use termwiz::input::Modifiers;
 
-use super::{Action, Ctx, Load, Mode, View, ctrl, cycle, failure, line_input, pick};
+use super::{Action, Ctx, Load, Mode, View, cycle, failure, keys, line_input, pick, theme, yank};
 use crate::{
-    app::{KeyCode, KeyEvent},
+    app::KeyEvent,
     error::{InputError, UiError},
     task::Task,
 };
@@ -133,6 +132,15 @@ impl Compose {
         });
     }
 
+    fn text(&self) -> String {
+        match self.focus {
+            Field::From => self.sender().cloned().unwrap_or_default(),
+            Field::To => self.to.lines().join("\n"),
+            Field::Subject => self.subject.lines().join("\n"),
+            Field::Body => self.body.lines().join("\n"),
+        }
+    }
+
     fn field(&mut self) -> Option<&mut TextArea<'static>> {
         match self.focus {
             Field::From => None,
@@ -156,7 +164,7 @@ impl View for Compose {
 
         let (focus, mode) = (self.focus, self.mode);
         let block = |title: &'static str, field: Field| {
-            let block = Block::bordered().title(title);
+            let block = theme::block().title(title);
             match (field == focus, mode) {
                 (true, Mode::Insert) => block.border_style(Style::new().green()),
                 (true, Mode::Normal) => block.border_style(Style::new().yellow()),
@@ -171,7 +179,7 @@ impl View for Compose {
                 self.sender().map(String::as_str).unwrap_or_default()
             )),
             Task::Done(Err(e)) => Line::from(failure(e)).red(),
-            _ => Line::from("loading…").dim(),
+            _ => Line::from("loading…").fg(theme::SUBTLE),
         };
         frame.render_widget(
             Paragraph::new(sender).block(block(" From ", Field::From)),
@@ -194,7 +202,7 @@ impl View for Compose {
 
         let line = match self.sending.poll() {
             Task::Unexecuted => Line::from(""),
-            Task::Running(_) => Line::from("sending…").dim(),
+            Task::Running(_) => Line::from("sending…").fg(theme::SUBTLE),
             Task::Done(Ok(())) => Line::from("sent ✓").green(),
             Task::Done(Err(e)) => Line::from(failure(e)).red(),
             Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
@@ -203,44 +211,60 @@ impl View for Compose {
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
-        let shift = key.modifiers.contains(Modifiers::SHIFT);
-        match (self.mode, key.key) {
-            (_, KeyCode::Char('s')) if ctrl(&key) => self.send(ctx),
-            (_, KeyCode::Tab) => self.focus = self.focus.step(!shift),
-            (_, KeyCode::LeftArrow | KeyCode::RightArrow) if self.focus == Field::From => {
-                self.cycle_sender(key.key == KeyCode::RightArrow);
+        let on_from = self.focus == Field::From;
+        match keys::Fields::get(&key) {
+            Some(keys::Fields::Submit) => {
+                self.send(ctx);
+                return Action::None;
             }
-            (Mode::Insert, KeyCode::Escape) => self.mode = Mode::Normal,
-            (Mode::Insert, KeyCode::Enter) if self.focus != Field::Body => {
+            Some(keys::Fields::Next) => {
                 self.focus = self.focus.step(true);
+                return Action::None;
             }
-            (Mode::Insert, _) => {
-                if let Some(area) = self.field() {
-                    area.input(key);
-                }
-            }
-            (Mode::Normal, KeyCode::Escape) => return Action::Pop,
-            (Mode::Normal, KeyCode::Char('i')) if self.focus != Field::From => {
-                self.mode = Mode::Insert;
-            }
-            (Mode::Normal, KeyCode::Char('j') | KeyCode::DownArrow) => {
-                self.focus = self.focus.step(true);
-            }
-            (Mode::Normal, KeyCode::Char('k') | KeyCode::UpArrow) => {
+            Some(keys::Fields::Prev) => {
                 self.focus = self.focus.step(false);
+                return Action::None;
             }
-            (Mode::Normal, KeyCode::Char(c @ ('h' | 'l'))) if self.focus == Field::From => {
-                self.cycle_sender(c == 'l');
+            Some(keys::Fields::Left) if on_from => {
+                self.cycle_sender(false);
+                return Action::None;
             }
-            _ => {}
+            Some(keys::Fields::Right) if on_from => {
+                self.cycle_sender(true);
+                return Action::None;
+            }
+            Some(keys::Fields::Left | keys::Fields::Right) | None => {}
+        }
+        match self.mode {
+            Mode::Insert => match keys::Insert::get(&key) {
+                Some(keys::Insert::Normal) => self.mode = Mode::Normal,
+                Some(keys::Insert::Next) if self.focus != Field::Body => {
+                    self.focus = self.focus.step(true);
+                }
+                Some(keys::Insert::Next) | None => {
+                    if let Some(area) = self.field() {
+                        area.input(key);
+                    }
+                }
+            },
+            Mode::Normal => match keys::Edit::get(&key) {
+                Some(keys::Edit::Back) => return Action::Pop,
+                Some(keys::Edit::Insert) if !on_from => self.mode = Mode::Insert,
+                Some(keys::Edit::Down) => self.focus = self.focus.step(true),
+                Some(keys::Edit::Up) => self.focus = self.focus.step(false),
+                Some(keys::Edit::Left) if on_from => self.cycle_sender(false),
+                Some(keys::Edit::Right) if on_from => self.cycle_sender(true),
+                Some(keys::Edit::Yank) => return yank(&self.text()),
+                Some(keys::Edit::Insert | keys::Edit::Left | keys::Edit::Right) | None => {}
+            },
         }
         Action::None
     }
 
-    fn help(&self) -> &'static str {
+    fn help(&self) -> keys::Help {
         match self.mode {
-            Mode::Normal => "i insert · j/k field · h/l sender · ctrl-s or :w send · esc back",
-            Mode::Insert => "esc normal · tab field · ←/→ sender · ctrl-s send",
+            Mode::Normal => &[keys::Edit::KEYS, keys::Fields::KEYS],
+            Mode::Insert => &[keys::Insert::KEYS, keys::Fields::KEYS],
         }
     }
 

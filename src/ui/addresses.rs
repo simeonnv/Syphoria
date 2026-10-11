@@ -5,17 +5,16 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::Line,
-    widgets::{Block, List, ListState, Paragraph},
+    widgets::{List, ListState, Paragraph},
 };
 use ratatui_textarea::TextArea;
-use termwiz::input::Modifiers;
 
 use super::{
-    Action, Ctx, Load, Mode, View, contains, ctrl, failure, find_match, line_input, list_nav,
-    status, yank,
+    Action, Ctx, Load, Mode, View, contains, failure, find_match, keys, line_input, list_nav,
+    status, theme, yank,
 };
 use crate::{
-    app::{KeyCode, KeyEvent},
+    app::KeyEvent,
     error::{InputError, UiError},
     stalwart::Address,
     state::User,
@@ -75,16 +74,19 @@ impl View for Addresses {
         let [main, prompt] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
 
-        let block = Block::bordered().title(" Addresses ");
+        let block = theme::block().title(" Addresses ");
         let inner = block.inner(main);
         frame.render_widget(block, main);
         match self.list.poll() {
             Task::Done(Ok(list)) if list.is_empty() => {
-                frame.render_widget(Line::from("no addresses yet, press a").dim(), inner);
+                frame.render_widget(
+                    Line::from("no addresses yet, press a").fg(theme::SUBTLE),
+                    inner,
+                );
             }
             Task::Done(Ok(list)) => {
-                let list = List::new(list.iter().map(String::as_str))
-                    .highlight_style(Style::new().reversed());
+                let list =
+                    List::new(list.iter().map(String::as_str)).highlight_style(theme::SELECTED);
                 frame.render_stateful_widget(list, inner, &mut self.selected);
             }
             other => status(frame, inner, other),
@@ -94,9 +96,7 @@ impl View for Addresses {
             State::Browse => {
                 if let Some(error) = &self.error {
                     frame.render_widget(
-                        Paragraph::new(failure(error))
-                            .red()
-                            .block(Block::bordered()),
+                        Paragraph::new(failure(error)).red().block(theme::block()),
                         prompt,
                     );
                 }
@@ -114,7 +114,7 @@ impl View for Addresses {
                     Constraint::Length(suffix.len() as u16 + 2),
                 ])
                 .areas(prompt);
-                let block = Block::bordered().title(" new address · addresses are permanent ");
+                let block = theme::block().title(" new address · addresses are permanent ");
                 local.set_block(match &self.error {
                     Some(error) => block
                         .title_bottom(Line::from(format!(" {} ", failure(error))).red())
@@ -124,7 +124,7 @@ impl View for Addresses {
                 local.set_cursor_style(Style::new().reversed());
                 frame.render_widget(&**local, left);
                 frame.render_widget(
-                    Paragraph::new(suffix).block(Block::bordered().title(" tab ")),
+                    Paragraph::new(suffix).block(theme::block().title(" tab ")),
                     right,
                 );
             }
@@ -138,33 +138,31 @@ impl View for Addresses {
                 if list_nav(&mut self.selected, &key) {
                     return Action::None;
                 }
-                match key.key {
-                    KeyCode::Char('r') => self.reload(ctx),
-                    KeyCode::Char('a') if !ctx.user.domains.is_empty() => {
+                match keys::Addresses::get(&key) {
+                    Some(keys::Addresses::Reload) => self.reload(ctx),
+                    Some(keys::Addresses::Add) if !ctx.user.domains.is_empty() => {
                         self.state = State::Create {
                             local: line_input(random_local_part()),
                             domain: 0,
                         };
                     }
-                    KeyCode::Char('y') => {
+                    Some(keys::Addresses::Yank) => {
                         if let Some(address) = self.selected() {
                             return yank(address);
                         }
                     }
-                    KeyCode::Escape => return Action::Pop,
-                    _ => {}
+                    Some(keys::Addresses::Back) => return Action::Pop,
+                    Some(keys::Addresses::Add) | None => {}
                 }
             }
             State::Create { local, domain } => {
                 let domains = ctx.user.domains.len();
-                match key.key {
-                    KeyCode::Escape => self.state = State::Browse,
-                    KeyCode::Tab if key.modifiers.contains(Modifiers::SHIFT) => {
-                        *domain = (*domain + domains - 1) % domains;
-                    }
-                    KeyCode::Tab => *domain = (*domain + 1) % domains,
-                    KeyCode::Char('r') if ctrl(&key) => *local = line_input(random_local_part()),
-                    KeyCode::Enter => {
+                match keys::NewAddress::get(&key) {
+                    Some(keys::NewAddress::Cancel) => self.state = State::Browse,
+                    Some(keys::NewAddress::Prev) => *domain = (*domain + domains - 1) % domains,
+                    Some(keys::NewAddress::Next) => *domain = (*domain + 1) % domains,
+                    Some(keys::NewAddress::Random) => *local = line_input(random_local_part()),
+                    Some(keys::NewAddress::Create) => {
                         let (state, user) = (ctx.state, ctx.user);
                         let Some(domain) = user.domains.iter().nth(*domain) else {
                             return Action::None;
@@ -189,7 +187,7 @@ impl View for Addresses {
                             Err(e) => self.error = Some(e),
                         }
                     }
-                    _ => {
+                    None => {
                         local.input(key);
                     }
                 }
@@ -198,10 +196,10 @@ impl View for Addresses {
         Action::None
     }
 
-    fn help(&self) -> &'static str {
+    fn help(&self) -> keys::Help {
         match self.state {
-            State::Browse => "a add · y yank · r reload · esc back",
-            State::Create { .. } => "tab domain · ctrl-r random · enter create · esc cancel",
+            State::Browse => &[keys::Addresses::KEYS],
+            State::Create { .. } => &[keys::NewAddress::KEYS],
         }
     }
 
