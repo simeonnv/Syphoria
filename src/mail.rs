@@ -1,11 +1,11 @@
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use chrono::{DateTime, Utc};
 use exn::{OptionExt, Result};
 use jmap_client::{
     client::Client,
-    core::{response::EmailSetResponse, set::SetObject},
-    email::{self, EmailAddress, EmailBodyPart, Property},
+    core::{query, response::EmailSetResponse, set::SetObject},
+    email::{self, EmailAddress, EmailBodyPart, Property, query::Filter as Condition},
     mailbox::{self, Role},
 };
 use url::Url;
@@ -16,6 +16,49 @@ const SEEN: &str = "$seen";
 const JUNK: &str = "$junk";
 const NOT_JUNK: &str = "$notjunk";
 const PAGE: usize = 200;
+const GET_LIMIT: usize = 500;
+const CORRESPONDENTS: usize = 1000;
+
+type Filter = query::Filter<Condition>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Term {
+    Me(String),
+    With(String),
+    From(String),
+    To(String),
+    Subject(String),
+    In(String),
+    Unread,
+    Read,
+    Text(String),
+}
+
+impl Term {
+    fn filter(&self) -> Filter {
+        match self {
+            Term::Me(a) => Filter::or([
+                Condition::from(a),
+                Condition::to(a),
+                Condition::cc(a),
+                Condition::bcc(a),
+            ]),
+            Term::With(a) => Filter::or([Condition::from(a), Condition::to(a), Condition::cc(a)]),
+            Term::From(a) => Condition::from(a).into(),
+            Term::To(a) => Condition::to(a).into(),
+            Term::Subject(s) => Condition::subject(s).into(),
+            Term::In(mailbox) => Condition::in_mailbox(mailbox).into(),
+            Term::Unread => Condition::not_keyword(SEEN).into(),
+            Term::Read => Condition::has_keyword(SEEN).into(),
+            Term::Text(t) => Condition::text(t).into(),
+        }
+    }
+}
+
+pub struct Found {
+    pub total: usize,
+    pub summaries: Vec<Summary>,
+}
 
 pub struct Mail {
     client: Client,
@@ -46,6 +89,7 @@ pub struct Summary {
     pub to: Vec<Addr>,
     pub subject: String,
     pub seen: bool,
+    pub mailbox: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,12 +212,26 @@ impl Mail {
     }
 
     pub async fn summaries(&self, mailbox: &str) -> Result<Vec<Summary>, RemoteError> {
+        let found = self.query(&[Term::In(mailbox.to_owned())], 0, PAGE).await?;
+        Ok(found.summaries)
+    }
+
+    pub async fn query(
+        &self,
+        terms: &[Term],
+        position: usize,
+        limit: usize,
+    ) -> Result<Found, RemoteError> {
         let mut request = self.client.build();
-        let query = request
-            .query_email()
-            .filter(email::query::Filter::in_mailbox(mailbox))
+        let query = request.query_email();
+        if !terms.is_empty() {
+            query.filter(Filter::and(terms.iter().map(Term::filter)));
+        }
+        query
             .sort([email::query::Comparator::received_at().descending()])
-            .limit(PAGE);
+            .position(position as i32)
+            .limit(limit.min(GET_LIMIT))
+            .calculate_total(true);
 
         let ids = query.result_reference();
         request.get_email().ids_ref(ids).properties([
@@ -183,20 +241,29 @@ impl Mail {
             Property::To,
             Property::Subject,
             Property::Keywords,
+            Property::MailboxIds,
         ]);
 
-        let list = request
+        let mut responses = request
             .send()
             .await
             .map_err(RemoteError::jmap)?
-            .unwrap_method_responses()
+            .unwrap_method_responses();
+        let list = responses
             .pop()
             .ok_or_raise(|| RemoteError::Internal)?
             .unwrap_get_email()
             .map_err(RemoteError::jmap)?
             .take_list();
+        let total = responses
+            .pop()
+            .ok_or_raise(|| RemoteError::Internal)?
+            .unwrap_query_email()
+            .map_err(RemoteError::jmap)?
+            .total()
+            .unwrap_or(position + list.len());
 
-        Ok(list
+        let summaries = list
             .into_iter()
             .map(|e| Summary {
                 id: e.id().unwrap_or_default().to_owned(),
@@ -205,8 +272,54 @@ impl Mail {
                 to: addrs(e.to()),
                 subject: e.subject().unwrap_or_default().to_owned(),
                 seen: e.keywords().contains(&SEEN),
+                mailbox: e.mailbox_ids().first().map(|id| (*id).to_owned()),
             })
-            .collect())
+            .collect();
+        Ok(Found { total, summaries })
+    }
+
+    pub async fn correspondents(&self) -> Result<Vec<String>, RemoteError> {
+        let mut request = self.client.build();
+        for position in (0..CORRESPONDENTS).step_by(GET_LIMIT) {
+            let query = request.query_email();
+            query
+                .sort([email::query::Comparator::received_at().descending()])
+                .position(position as i32)
+                .limit(GET_LIMIT);
+            let ids = query.result_reference();
+            request.get_email().ids_ref(ids).properties([
+                Property::From,
+                Property::To,
+                Property::Cc,
+            ]);
+        }
+
+        let responses = request
+            .send()
+            .await
+            .map_err(RemoteError::jmap)?
+            .unwrap_method_responses();
+        let mut seen = HashSet::new();
+        let mut list = Vec::new();
+        for response in responses.into_iter().skip(1).step_by(2) {
+            for email in response
+                .unwrap_get_email()
+                .map_err(RemoteError::jmap)?
+                .take_list()
+            {
+                for addr in [email.from(), email.to(), email.cc()]
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let address = addr.email().to_lowercase();
+                    if seen.insert(address.clone()) {
+                        list.push(address);
+                    }
+                }
+            }
+        }
+        Ok(list)
     }
 
     pub async fn message(&self, id: &str) -> Result<Message, RemoteError> {

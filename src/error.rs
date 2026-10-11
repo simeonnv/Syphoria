@@ -134,6 +134,8 @@ pub enum InputError {
     InvalidRecipient(String),
     #[error("add at least one recipient")]
     NoRecipients,
+    #[error("unknown folder `{0}`")]
+    UnknownFolder(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +172,10 @@ pub enum UiError {
     LoadFolders,
     #[error("failed to load messages")]
     LoadMessages,
+    #[error("failed to search messages")]
+    Search,
+    #[error("failed to load correspondents")]
+    LoadCorrespondents,
     #[error("failed to load message")]
     LoadMessage,
     #[error("failed to send message")]

@@ -263,6 +263,18 @@ keymap! {
         Undo: Char('z') => "undo",
         Reload: Char('r') => "reload",
     }
+    SearchInput {
+        Run: Enter => "search",
+        Complete: Tab => "complete",
+        Next: Down | Ctrl('n') => "next suggestion",
+        Prev: Up | Ctrl('p') => "previous suggestion",
+        Results: Esc => "results",
+    }
+    SearchResults {
+        Open: Enter => "open",
+        Read: Char('U') => "read",
+        Reload: Char('r') => "reload",
+    }
     Reader {
         Reply: Char('r') => "reply",
         ReplyAll: Char('R') => "reply all",
@@ -343,6 +355,14 @@ const _: () = {
         Mail::KEYS,
         Reader::KEYS,
     ]);
+    disjoint(&[
+        Always::KEYS,
+        Global::KEYS,
+        Nav::KEYS,
+        Mail::KEYS,
+        SearchResults::KEYS,
+    ]);
+    disjoint(&[Always::KEYS, SearchInput::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Addresses::KEYS]);
     disjoint(&[Always::KEYS, NewAddress::KEYS]);
     disjoint(&[Always::KEYS, Unlock::KEYS]);

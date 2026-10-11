@@ -4,6 +4,7 @@ mod compose;
 mod keys;
 mod messages;
 mod reader;
+mod search;
 mod theme;
 
 use std::{error::Error, sync::Arc};
@@ -37,6 +38,7 @@ use addresses::Addresses;
 use compose::{Compose, Draft};
 use messages::Messages;
 use reader::Reader;
+use search::Search;
 
 type Load<T> = Task<exn::Result<T, UiError>>;
 
@@ -153,6 +155,7 @@ pub enum Page {
     Accounts,
     AccountView,
     AccountForm,
+    Search,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -368,12 +371,23 @@ impl Session {
         }
         match keys::Global::get(&key) {
             Some(keys::Global::Command) => self.open_prompt(PromptKind::Command),
-            Some(keys::Global::Search) => self.open_prompt(PromptKind::Search),
+            Some(keys::Global::Search) => self.open_search(),
             Some(keys::Global::Goto) => self.pending = Some(Prefix::Goto),
             Some(keys::Global::Space) => self.pending = Some(Prefix::Space),
             Some(keys::Global::NextMatch) => self.find(true),
             Some(keys::Global::PrevMatch) => self.find(false),
             None => self.send(key),
+        }
+    }
+
+    fn open_search(&mut self) {
+        match self.stack.last_mut() {
+            Some(Page::Search(page)) => page.focus(),
+            Some(Page::Messages(_) | Page::Reader(_)) => {
+                let page = Search::new(&self.ctx, self.folders.clone());
+                self.stack.push(page.into());
+            }
+            _ => self.open_prompt(PromptKind::Search),
         }
     }
 
