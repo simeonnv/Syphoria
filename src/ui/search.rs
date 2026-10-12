@@ -603,7 +603,7 @@ fn labels(folder: &Folder) -> Vec<String> {
         Role::Drafts => "drafts",
         Role::Sent => "sent",
         Role::Archive => "archive",
-        Role::Junk => "junk",
+        Role::Junk => "spam",
         Role::Trash => "trash",
         _ => "",
     };

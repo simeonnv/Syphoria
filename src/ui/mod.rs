@@ -7,7 +7,7 @@ mod reader;
 mod search;
 mod theme;
 
-use std::{error::Error, sync::Arc};
+use std::{cell::Cell, error::Error, sync::Arc, time::Instant};
 
 use chrono::{DateTime, Utc};
 use enum_dispatch::enum_dispatch;
@@ -59,6 +59,7 @@ pub struct Ctx {
     pub user: &'static User,
     pub mail: Arc<Mail>,
     pub vault: Option<Db>,
+    pub sent_at: Cell<Option<Instant>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -662,6 +663,7 @@ impl Pages {
                     user,
                     mail: Arc::new(mail),
                     vault: None,
+                    sent_at: Cell::new(None),
                 })
             }),
             session: None,

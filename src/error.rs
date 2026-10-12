@@ -208,6 +208,8 @@ pub enum UiError {
     NoAddress,
     #[error("sender is not on one of your domains")]
     ForeignSender,
+    #[error("sending too fast, wait {0}s between messages")]
+    SendCooldown(u64),
     #[error("invalid recipients")]
     InvalidRecipients,
     #[error("failed to load accounts")]

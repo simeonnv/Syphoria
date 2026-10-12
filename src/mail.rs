@@ -204,7 +204,10 @@ impl Mail {
             .into_iter()
             .map(|m| Folder {
                 id: m.id().unwrap_or_default().to_owned(),
-                name: m.name().unwrap_or_default().to_owned(),
+                name: match m.role() {
+                    Role::Junk => "Spam".to_owned(),
+                    _ => m.name().unwrap_or_default().to_owned(),
+                },
                 role: m.role(),
                 unread: m.unread_emails(),
             })

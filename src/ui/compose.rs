@@ -1,4 +1,7 @@
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use email_address::EmailAddress;
 use exn::{ErrorExt, ResultExt, ensure};
@@ -17,6 +20,8 @@ use crate::{
     error::{InputError, UiError},
     task::Task,
 };
+
+const COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct Draft {
@@ -104,6 +109,15 @@ impl Compose {
         if matches!(self.sending, Task::Running(_)) {
             return;
         }
+        let now = Instant::now();
+        if ctx
+            .sent_at
+            .get()
+            .is_some_and(|at| now.duration_since(at) < COOLDOWN)
+        {
+            self.sending = Task::Done(Err(UiError::SendCooldown(COOLDOWN.as_secs()).raise()));
+            return;
+        }
         let Some(from) = self.sender().cloned() else {
             self.sending = Task::Done(Err(UiError::NoAddress.raise()));
             return;
@@ -125,6 +139,7 @@ impl Compose {
         let subject = self.subject.lines().join(" ");
         let body = self.body.lines().join("\n");
         self.mode = Mode::Normal;
+        ctx.sent_at.set(Some(now));
         self.sending.spawn(async move {
             mail.send(&name, &from, &to, &subject, &body)
                 .await
@@ -207,7 +222,7 @@ impl View for Compose {
             Task::Done(Err(e)) => Line::from(failure(e)).red(),
             Task::Panicked(e) => Line::from(format!("error: {e}")).red(),
         };
-        frame.render_widget(line, status);
+        frame.render_widget(line.bold(), status);
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {

@@ -209,7 +209,7 @@ keymap! {
         Drafts: Char('d') => "drafts",
         Sent: Char('s') => "sent",
         Archive: Char('a') => "archive",
-        Junk: Char('j') => "junk",
+        Junk: Char('j') => "spam",
         Trash: Char('t') => "trash",
         Next: Char('n') => "next sidebar entry",
         Prev: Char('p') => "previous sidebar entry",
@@ -243,13 +243,13 @@ keymap! {
     MoveTo {
         Inbox: Char('i') => "inbox",
         Archive: Char('a') => "archive",
-        Junk: Char('j') => "junk",
+        Junk: Char('j') => "spam",
         Trash: Char('t') => "trash",
     }
     Mail {
         Trash: Char('d') => "trash",
         Archive: Char('a') => "archive",
-        Junk: Char('!') => "junk / restore",
+        Junk: Char('!') => "spam / restore",
         Delete: Alt('d') => "delete",
         Move: Char('m') => "move",
         Unread: Char('u') => "unread",
