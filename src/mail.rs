@@ -100,6 +100,15 @@ pub struct Message {
     pub cc: Vec<Addr>,
     pub subject: String,
     pub body: String,
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub blob_id: String,
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
 }
 
 impl Mail {
@@ -339,6 +348,7 @@ impl Mail {
                 Property::Subject,
                 Property::TextBody,
                 Property::BodyValues,
+                Property::Attachments,
             ])
             .arguments()
             .fetch_text_body_values(true);
@@ -372,6 +382,50 @@ impl Mail {
             cc: addrs(email.cc()),
             subject: email.subject().unwrap_or_default().to_owned(),
             body,
+            attachments: email
+                .attachments()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|part| {
+                    Some(Attachment {
+                        blob_id: part.blob_id()?.to_owned(),
+                        name: part.name().unwrap_or("attachment").to_owned(),
+                        kind: part
+                            .content_type()
+                            .unwrap_or("application/octet-stream")
+                            .to_owned(),
+                        size: part.size() as u64,
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn download(&self, blob_id: &str) -> Result<Vec<u8>, RemoteError> {
+        self.client
+            .download(blob_id)
+            .await
+            .map_err(RemoteError::jmap)
+    }
+
+    pub async fn upload(
+        &self,
+        name: &str,
+        kind: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Attachment, RemoteError> {
+        let size = bytes.len() as u64;
+        let blob_id = self
+            .client
+            .upload(None, bytes, Some(kind))
+            .await
+            .map_err(RemoteError::jmap)?
+            .take_blob_id();
+        Ok(Attachment {
+            blob_id,
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            size,
         })
     }
 
@@ -382,6 +436,7 @@ impl Mail {
         to: &[String],
         subject: &str,
         body: &str,
+        attachments: &[Attachment],
     ) -> Result<(), RemoteError> {
         let identity = self.identity(name, from).await?;
 
@@ -400,6 +455,14 @@ impl Mail {
                     .content_type("text/plain"),
             )
             .body_value("body".into(), body);
+        for attachment in attachments {
+            email.attachment(
+                EmailBodyPart::new()
+                    .blob_id(&attachment.blob_id)
+                    .name(&attachment.name)
+                    .content_type(&attachment.kind),
+            );
+        }
 
         let create_id = email.create_id().ok_or_raise(|| RemoteError::Internal)?;
 

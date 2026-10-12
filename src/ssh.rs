@@ -1,4 +1,11 @@
-use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use exn::{OptionExt, ResultExt};
 use ratatui::Terminal;
@@ -17,6 +24,7 @@ use crate::{
     app::App,
     backend::SshBackend,
     error::{HandlerError, SshError, StorageError},
+    sftp::Sftp,
     state::{AppState, User},
 };
 
@@ -88,7 +96,8 @@ impl Server for SshServer {
             refresh_rate: self.refresh_rate,
             peer,
             user: None,
-            app: None,
+            channels: HashMap::new(),
+            sftp: HashSet::new(),
             size: (80, 24),
             events: None,
             parser: InputParser::new(),
@@ -108,7 +117,8 @@ pub struct SessionHandler {
     refresh_rate: Option<Duration>,
     peer: Option<SocketAddr>,
     user: Option<&'static User>,
-    app: Option<Box<dyn App>>,
+    channels: HashMap<ChannelId, Channel<Msg>>,
+    sftp: HashSet<ChannelId>,
     size: (u16, u16),
     events: Option<mpsc::UnboundedSender<Event>>,
     parser: InputParser,
@@ -185,17 +195,54 @@ impl Handler for SessionHandler {
         let user = self.user.ok_or_raise(|| SshError::NoPublicKey)?;
 
         println!("connected: {} from {}", user.name, self.peer());
-
-        self.app = Some((self.factory)(self.state, user));
         Ok(())
     }
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, HandlerError> {
+        self.channels.insert(channel.id(), channel);
         Ok(true)
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        let user = self.user.ok_or_raise(|| SshError::NoPublicKey)?;
+        match (name, self.channels.remove(&channel)) {
+            ("sftp", Some(stream)) => {
+                session
+                    .channel_success(channel)
+                    .or_raise(|| SshError::Subsystem)?;
+                self.sftp.insert(channel);
+                println!("sftp: {} from {}", user.name, self.peer());
+                russh_sftp::server::run(stream.into_stream(), Sftp::new(self.state, user)).await;
+            }
+            _ => session
+                .channel_failure(channel)
+                .or_raise(|| SshError::Subsystem)?,
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        if self.sftp.remove(&channel) {
+            session
+                .exit_status_request(channel, 0)
+                .or_raise(|| SshError::Subsystem)?;
+            session.eof(channel).or_raise(|| SshError::Subsystem)?;
+            session.close(channel).or_raise(|| SshError::Subsystem)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -222,7 +269,9 @@ impl Handler for SessionHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), HandlerError> {
-        let app = self.app.take().ok_or_raise(|| SshError::NoApp)?;
+        let user = self.user.ok_or_raise(|| SshError::NoPublicKey)?;
+        self.channels.remove(&channel);
+        let app = (self.factory)(self.state, user);
 
         session
             .channel_success(channel)
@@ -252,6 +301,9 @@ impl Handler for SessionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), HandlerError> {
+        if self.events.is_none() {
+            return Ok(());
+        }
         let mut events = Vec::new();
         self.parser.parse(data, |e| events.push(e), false);
 

@@ -12,6 +12,10 @@ admin_password_file = ".devenv/state/stalwart/admin-password"
 [vault]
 dir = "/var/lib/syphoria/vault"
 
+[files]
+dir = "/var/lib/syphoria/files"
+quota_mb = 100
+
 [users.alice]
 ssh_keys = [
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy0V3T7hXYcCnRPYmD+pwWhb2WkGZJiV3dU8pKkUcZx alice@laptop",

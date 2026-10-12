@@ -28,6 +28,8 @@ pub enum ConfigError {
     AdminPassword,
     #[error("failed to set up vault")]
     Vault,
+    #[error("failed to set up file storage")]
+    Files,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +58,18 @@ pub enum StorageError {
     ReadHostKey,
     #[error("failed to create host key")]
     CreateHostKey,
+    #[error("failed to set up file storage")]
+    FilesSetup,
+    #[error("failed to list files")]
+    ListFiles,
+    #[error("failed to read file")]
+    ReadFile,
+    #[error("failed to write file")]
+    WriteFile,
+    #[error("failed to remove file")]
+    RemoveFile,
+    #[error("file storage full, {0} MB max")]
+    Quota(u64),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +164,8 @@ pub enum InputError {
     FixedAddresses,
     #[error("unknown folder `{0}`")]
     UnknownFolder(String),
+    #[error("invalid file name `{0}`")]
+    InvalidFileName(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -162,8 +178,8 @@ pub enum SshError {
     NoPublicKey,
     #[error("failed to accept pty request")]
     Pty,
-    #[error("shell requested before app was built")]
-    NoApp,
+    #[error("failed to handle subsystem request")]
+    Subsystem,
     #[error("failed to accept shell request")]
     Shell,
     #[error("failed to enter alternate screen")]
@@ -212,6 +228,16 @@ pub enum UiError {
     SendCooldown(u64),
     #[error("invalid recipients")]
     InvalidRecipients,
+    #[error("failed to attach `{0}`")]
+    Attach(String),
+    #[error("sent, but failed to remove attached files")]
+    RemoveSent,
+    #[error("failed to load files")]
+    LoadFiles,
+    #[error("failed to load attachment")]
+    LoadAttachment,
+    #[error("failed to save attachment")]
+    SaveAttachment,
     #[error("failed to load accounts")]
     LoadAccounts,
     #[error("failed to save account")]

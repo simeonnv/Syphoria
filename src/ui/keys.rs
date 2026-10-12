@@ -279,7 +279,17 @@ keymap! {
         Reply: Char('r') => "reply",
         ReplyAll: Char('R') => "reply all",
         Forward: Char('f') => "forward",
+        Attachments: Char('o') => "attachments",
         YankBody: Alt('y') => "yank body",
+    }
+    Attachments {
+        Open: Enter => "preview",
+        Save: Char('s') => "save to files",
+        Back: Esc => "back",
+    }
+    Preview {
+        Save: Char('s') => "save to files",
+        Back: Esc => "back",
     }
     Addresses {
         Add: Char('a') => "add",
@@ -338,6 +348,14 @@ keymap! {
     Password {
         Generate: Ctrl('r') => "generate password",
     }
+    Files {
+        Attach: Char('a') => "attach file",
+        Detach: Char('d') => "remove attachment",
+    }
+    Picker {
+        Pick: Enter => "attach",
+        Cancel: Esc => "cancel",
+    }
 }
 
 const _: () = {
@@ -362,6 +380,9 @@ const _: () = {
         Mail::KEYS,
         SearchResults::KEYS,
     ]);
+    disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Attachments::KEYS]);
+    disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Preview::KEYS]);
+    disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Picker::KEYS]);
     disjoint(&[Always::KEYS, SearchInput::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Addresses::KEYS]);
     disjoint(&[Always::KEYS, NewAddress::KEYS]);
@@ -374,6 +395,7 @@ const _: () = {
         Fields::KEYS,
         Edit::KEYS,
         Password::KEYS,
+        Files::KEYS,
     ]);
     disjoint(&[Always::KEYS, Fields::KEYS, Insert::KEYS, Password::KEYS]);
 };

@@ -1,5 +1,6 @@
 mod accounts;
 mod addresses;
+mod attachments;
 mod compose;
 mod keys;
 mod messages;
@@ -35,7 +36,8 @@ use crate::{
 
 use accounts::{AccountForm, AccountView, Accounts};
 use addresses::Addresses;
-use compose::{Compose, Draft};
+use attachments::{Attachments, Preview};
+use compose::{Attached, Compose, Draft};
 use messages::Messages;
 use reader::Reader;
 use search::Search;
@@ -157,6 +159,8 @@ pub enum Page {
     AccountView,
     AccountForm,
     Search,
+    Attachments,
+    Preview,
 }
 
 #[derive(Clone, PartialEq, Eq)]

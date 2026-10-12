@@ -17,6 +17,9 @@
   listenPort = lib.toInt (lib.last (lib.splitString ":" cfg.settings.server.listen));
   privilegedPort = listenPort < 1024;
 
+  fileQuota = cfg.settings.files.quota_mb * 1000000;
+  messageLimit = fileQuota * 3 / 2;
+
   services = ["syphoria.service"] ++ lib.optional stalwartLocal "stalwart.service";
 
   backupScript = pkgs.writeShellApplication {
@@ -78,7 +81,7 @@ in {
     settings = lib.mkOption {
       description = ''
         Contents of `syphoria.toml`. See `syphoria.example.toml`.
-        `server.host_key`, `vault.dir` and `stalwart.admin_password_file` are managed by the module.
+        `server.host_key`, `vault.dir`, `files.dir` and `stalwart.admin_password_file` are managed by the module.
       '';
       default = {};
       type = lib.types.submodule {
@@ -97,6 +100,11 @@ in {
             type = lib.types.str;
             default = "admin";
             description = "Stalwart admin and master user.";
+          };
+          files.quota_mb = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 100;
+            description = "Per-user file storage (SFTP uploads, saved attachments) in MB.";
           };
         };
       };
@@ -153,6 +161,7 @@ in {
         services.syphoria.settings = {
           server.host_key = "${stateDir}/host_ed25519";
           vault.dir = "${stateDir}/vault";
+          files.dir = "${stateDir}/files";
           stalwart.admin_password_file = credential;
         };
 
@@ -242,7 +251,17 @@ in {
               secret = stalwartSecret;
             };
             directory.internal.cache.size = "disable";
+            jmap.protocol.upload.max-size = fileQuota;
+            jmap.protocol.upload.quota.size = fileQuota * 10;
+            jmap.email.max-attachment-size = fileQuota;
+            jmap.email.max-size = messageLimit;
+            session.data.limits.size = messageLimit;
             config.local-keys = lib.mkDefault [
+              "jmap.protocol.upload.max-size"
+              "jmap.protocol.upload.quota.size"
+              "jmap.email.max-attachment-size"
+              "jmap.email.max-size"
+              "session.data.limits.size"
               "store.*"
               "directory.*"
               "tracer.*"

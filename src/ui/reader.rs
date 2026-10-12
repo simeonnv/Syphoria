@@ -9,8 +9,9 @@ use ratatui::{
 };
 
 use super::{
-    Action, Compose, Ctx, Draft, Load, Op, PAGE, View, confirm_popup, date, emails, failure,
-    junk_target, keys, keys_popup, move_target, status, theme, yank,
+    Action, Attached, Attachments, Compose, Ctx, Draft, Load, Op, PAGE, View, attachments::size,
+    confirm_popup, date, emails, failure, junk_target, keys, keys_popup, move_target, status,
+    theme, yank,
 };
 use crate::{
     app::KeyEvent,
@@ -95,7 +96,10 @@ impl Reader {
 
     fn lines(&self) -> u16 {
         match &self.message {
-            Task::Done(Ok(message)) => (message.body.lines().count() + 5) as u16,
+            Task::Done(Ok(message)) => {
+                let cc = usize::from(!message.cc.is_empty());
+                (message.body.lines().count() + message.attachments.len() + cc + 5) as u16
+            }
             _ => 0,
         }
     }
@@ -133,6 +137,14 @@ impl View for Reader {
         ]);
         if !message.cc.is_empty() {
             text.lines.insert(2, header("cc:      ", list(&message.cc)));
+        }
+        let at = text.lines.len() - 1;
+        for (i, a) in message.attachments.iter().enumerate() {
+            let label = if i == 0 { "files:   " } else { "         " };
+            text.lines.insert(
+                at + i,
+                header(label, format!("{} ({})", a.name, size(a.size))),
+            );
         }
         text.extend(message.body.lines().map(Line::from));
 
@@ -195,8 +207,11 @@ impl View for Reader {
             Some(keys::Reader::Forward) => {
                 Action::Push(Box::new(Compose::new(ctx, forward(ctx, message)).into()))
             }
+            Some(keys::Reader::Attachments) if !message.attachments.is_empty() => Action::Push(
+                Box::new(Attachments::new(ctx, message.attachments.clone()).into()),
+            ),
             Some(keys::Reader::YankBody) => yank(&message.body),
-            None => Action::None,
+            Some(keys::Reader::Attachments) | None => Action::None,
         }
     }
 
@@ -267,6 +282,7 @@ fn reply(ctx: &Ctx, message: &Message, all: bool) -> Draft {
         to: to.join(", "),
         subject: prefixed("Re:", &message.subject),
         body: format!("\n\n{quoted}"),
+        attachments: Vec::new(),
     }
 }
 
@@ -283,5 +299,11 @@ fn forward(ctx: &Ctx, message: &Message) -> Draft {
             list(&message.to),
             message.body
         ),
+        attachments: message
+            .attachments
+            .iter()
+            .cloned()
+            .map(Attached::Mail)
+            .collect(),
     }
 }

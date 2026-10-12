@@ -24,6 +24,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub stalwart: StalwartConfig,
     pub vault: VaultConfig,
+    pub files: FilesConfig,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub users: BTreeMap<Username, UserConfig>,
@@ -48,6 +49,13 @@ pub struct StalwartConfig {
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     pub dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesConfig {
+    pub dir: PathBuf,
+    pub quota_mb: u64,
 }
 
 #[serde_as]
@@ -160,6 +168,7 @@ impl Config {
                 &mut config.server.host_key,
                 &mut config.stalwart.admin_password_file,
                 &mut config.vault.dir,
+                &mut config.files.dir,
             ] {
                 if file.is_relative() {
                     *file = dir.join(&*file);

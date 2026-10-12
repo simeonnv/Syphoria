@@ -63,6 +63,17 @@
     };
 
     session.auth.require = false;
+    session.data.limits.size = 150000000;
+    jmap = {
+      protocol.upload = {
+        max-size = 100000000;
+        quota.size = 1000000000;
+      };
+      email = {
+        max-attachment-size = 100000000;
+        max-size = 150000000;
+      };
+    };
     spam-filter.enable = false;
     auth = {
       spf.verify = {
@@ -96,6 +107,10 @@
       "session.*"
       "spam-filter.*"
       "auth.*"
+      "jmap.protocol.upload.max-size"
+      "jmap.protocol.upload.quota.size"
+      "jmap.email.max-attachment-size"
+      "jmap.email.max-size"
     ];
   };
 in {
