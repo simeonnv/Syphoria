@@ -1,23 +1,37 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+};
 
 use chrono::{DateTime, Utc};
-use exn::{OptionExt, Result};
+use exn::{OptionExt, Result, ResultExt};
 use jmap_client::{
     client::Client,
     core::{query, response::EmailSetResponse, set::SetObject},
     email::{self, EmailAddress, EmailBodyPart, Property, query::Filter as Condition},
     mailbox::{self, Role},
+    sieve,
 };
 use url::Url;
 
 use crate::error::RemoteError;
 
 const SEEN: &str = "$seen";
-const JUNK: &str = "$junk";
-const NOT_JUNK: &str = "$notjunk";
+const SPAM: &str = "$junk";
+const NOT_SPAM: &str = "$notjunk";
 const PAGE: usize = 200;
 const GET_LIMIT: usize = 500;
 const CORRESPONDENTS: usize = 1000;
+const SCRIPT: &str = "syphoria";
+const RULE: &str = "if envelope :is \"to\" \"";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delivery {
+    #[default]
+    Active,
+    Spam,
+    Blocked,
+}
 
 type Filter = query::Filter<Condition>;
 
@@ -64,6 +78,7 @@ pub struct Mail {
     client: Client,
     pub inbox: String,
     sent: String,
+    spam: String,
     mailboxes: Vec<(Role, String)>,
 }
 
@@ -124,6 +139,7 @@ impl Mail {
             client,
             inbox: String::new(),
             sent: String::new(),
+            spam: String::new(),
             mailboxes: Vec::new(),
         };
 
@@ -133,11 +149,11 @@ impl Mail {
             folders
                 .iter()
                 .find(|f| f.role == role)
-                .map(|f| f.id.clone())
                 .ok_or_raise(|| RemoteError::NoMailbox(format!("{role:?}")))
         };
-        mail.inbox = find(Role::Inbox)?;
-        mail.sent = find(Role::Sent)?;
+        mail.inbox = find(Role::Inbox)?.id.clone();
+        mail.sent = find(Role::Sent)?.id.clone();
+        mail.spam = find(Role::Junk)?.id.clone();
         mail.mailboxes = folders
             .into_iter()
             .filter(|f| f.role != Role::None)
@@ -165,8 +181,8 @@ impl Mail {
     ) -> Result<(), RemoteError> {
         let mut request = self.client.build();
         let email = request.set_email().update(id).mailbox_ids([mailbox]);
-        if let Some(junk) = junk(from, to) {
-            email.keyword(JUNK, junk).keyword(NOT_JUNK, !junk);
+        if let Some(spam) = spam(from, to) {
+            email.keyword(SPAM, spam).keyword(NOT_SPAM, !spam);
         }
         request
             .send_single::<EmailSetResponse>()
@@ -351,6 +367,110 @@ impl Mail {
             }
         }
         Ok(list)
+    }
+
+    pub async fn received(
+        &self,
+        addresses: &[String],
+    ) -> Result<HashMap<String, usize>, RemoteError> {
+        let max = self
+            .client
+            .session()
+            .core_capabilities()
+            .map_or(1, |c| c.max_calls_in_request())
+            .max(1);
+        let mut counts = HashMap::new();
+        for chunk in addresses.chunks(max) {
+            let mut request = self.client.build();
+            for address in chunk {
+                request
+                    .query_email()
+                    .filter(Filter::and([
+                        Filter::or([Condition::to(address), Condition::cc(address)]),
+                        Condition::in_mailbox_other_than([self.sent.as_str()]).into(),
+                    ]))
+                    .limit(1)
+                    .calculate_total(true);
+            }
+            let responses = request
+                .send()
+                .await
+                .map_err(RemoteError::jmap)?
+                .unwrap_method_responses();
+            for (address, response) in chunk.iter().zip(responses) {
+                let total = response
+                    .unwrap_query_email()
+                    .map_err(RemoteError::jmap)?
+                    .total()
+                    .ok_or_raise(|| RemoteError::Internal)?;
+                counts.insert(address.clone(), total);
+            }
+        }
+        Ok(counts)
+    }
+
+    pub async fn deliveries(&self) -> Result<BTreeMap<String, Delivery>, RemoteError> {
+        Ok(self
+            .script()
+            .await?
+            .map(|(_, text)| rules(&text))
+            .unwrap_or_default())
+    }
+
+    pub async fn set_delivery(
+        &self,
+        address: &str,
+        delivery: Delivery,
+    ) -> Result<BTreeMap<String, Delivery>, RemoteError> {
+        let existing = self.script().await?;
+        let mut rules = existing
+            .as_ref()
+            .map(|(_, text)| rules(text))
+            .unwrap_or_default();
+        match delivery {
+            Delivery::Active => rules.remove(address),
+            other => rules.insert(address.to_owned(), other),
+        };
+        let text = script(&rules, &self.spam);
+        match existing {
+            Some((id, _)) => {
+                self.client
+                    .sieve_script_replace(&id, text, true)
+                    .await
+                    .map_err(RemoteError::jmap)?;
+            }
+            None => {
+                self.client
+                    .sieve_script_create(SCRIPT, text, true)
+                    .await
+                    .map_err(RemoteError::jmap)?;
+            }
+        }
+        Ok(rules)
+    }
+
+    async fn script(&self) -> Result<Option<(String, String)>, RemoteError> {
+        let mut request = self.client.build();
+        request.get_sieve_script().properties([
+            sieve::Property::Id,
+            sieve::Property::Name,
+            sieve::Property::BlobId,
+        ]);
+        let Some(script) = request
+            .send_get_sieve_script()
+            .await
+            .map_err(RemoteError::jmap)?
+            .take_list()
+            .into_iter()
+            .find(|s| s.name() == Some(SCRIPT))
+        else {
+            return Ok(None);
+        };
+        let id = script.id().ok_or_raise(|| RemoteError::Internal)?;
+        let blob = script.blob_id().ok_or_raise(|| RemoteError::Internal)?;
+        let text =
+            String::from_utf8(self.download(blob).await?).or_raise(|| RemoteError::Internal)?;
+        Ok(Some((id.to_owned(), text)))
     }
 
     pub async fn message(&self, id: &str) -> Result<Message, RemoteError> {
@@ -543,6 +663,37 @@ fn addrs(list: Option<&[EmailAddress]>) -> Vec<Addr> {
         .collect()
 }
 
+fn rules(script: &str) -> BTreeMap<String, Delivery> {
+    script
+        .lines()
+        .filter_map(|line| {
+            let (address, action) = line.strip_prefix(RULE)?.split_once('"')?;
+            let delivery = if action.contains("discard") {
+                Delivery::Blocked
+            } else if action.contains("fileinto") {
+                Delivery::Spam
+            } else {
+                return None;
+            };
+            Some((address.to_owned(), delivery))
+        })
+        .collect()
+}
+
+fn script(rules: &BTreeMap<String, Delivery>, spam: &str) -> String {
+    let mut text =
+        String::from("require [\"envelope\", \"fileinto\", \"mailbox\", \"mailboxid\"];\n");
+    for (address, delivery) in rules {
+        let action = match delivery {
+            Delivery::Active => continue,
+            Delivery::Spam => format!("fileinto :mailboxid \"{spam}\" \"INBOX\""),
+            Delivery::Blocked => "discard".to_owned(),
+        };
+        text.push_str(&format!("{RULE}{address}\" {{ {action}; stop; }}\n"));
+    }
+    text
+}
+
 fn rank(role: &Role) -> u8 {
     match role {
         Role::Inbox => 0,
@@ -555,7 +706,7 @@ fn rank(role: &Role) -> u8 {
     }
 }
 
-fn junk(from: &Role, to: &Role) -> Option<bool> {
+fn spam(from: &Role, to: &Role) -> Option<bool> {
     match (from, to) {
         (Role::Junk, Role::Junk) => None,
         (_, Role::Junk) => Some(true),

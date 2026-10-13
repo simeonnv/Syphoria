@@ -9,8 +9,8 @@ use ratatui::{
 };
 
 use super::{
-    Action, Ctx, Load, Op, Reader, View, confirm_popup, contains, date, emails, find_match,
-    junk_target, keys, keys_popup, move_target, names, status, table_nav, theme, yank,
+    Action, Ctx, Load, Op, Reader, View, confirm_popup, contains, date, emails, find_match, keys,
+    keys_popup, move_target, names, spam_target, status, table_nav, theme, yank,
 };
 use crate::{app::KeyEvent, error::UiError, mail::Summary, task::Task};
 
@@ -104,7 +104,7 @@ impl Messages {
             keys::Mail::Back => return Action::Pop,
             keys::Mail::Trash => self.move_selected(ctx, Role::Trash),
             keys::Mail::Archive => self.move_selected(ctx, Role::Archive),
-            keys::Mail::Junk => self.move_selected(ctx, junk_target(&self.role)),
+            keys::Mail::Spam => self.move_selected(ctx, spam_target(&self.role)),
             keys::Mail::Delete => {
                 if let Some(message) = self.selected() {
                     self.pending = Some(Pending::Destroy(message.id.clone()));

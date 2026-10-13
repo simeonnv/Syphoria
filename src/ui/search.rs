@@ -20,9 +20,9 @@ use ratatui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    Action, Ctx, Load, Mode, Op, Reader, View, confirm_popup, date, emails, failure, junk_target,
-    keys, keys_popup, line_input, move_target, names, suggest, suggestions_popup, table_nav, theme,
-    yank,
+    Action, Ctx, Load, Mode, Op, Reader, View, confirm_popup, date, emails, failure, keys,
+    keys_popup, line_input, move_target, names, spam_target, suggest, suggestions_popup, table_nav,
+    theme, yank,
 };
 use crate::{
     app::KeyEvent,
@@ -296,9 +296,9 @@ impl Search {
             keys::Mail::Back => return Action::Pop,
             keys::Mail::Trash => self.move_selected(ctx, Role::Trash),
             keys::Mail::Archive => self.move_selected(ctx, Role::Archive),
-            keys::Mail::Junk => {
+            keys::Mail::Spam => {
                 if let Some(i) = self.selected() {
-                    let to = junk_target(&self.role(&self.results[i]));
+                    let to = spam_target(&self.role(&self.results[i]));
                     self.move_selected(ctx, to);
                 }
             }

@@ -123,12 +123,12 @@ fn move_target(key: &KeyEvent) -> Option<Role> {
     keys::MoveTo::get(key).map(|target| match target {
         keys::MoveTo::Inbox => Role::Inbox,
         keys::MoveTo::Archive => Role::Archive,
-        keys::MoveTo::Junk => Role::Junk,
+        keys::MoveTo::Spam => Role::Junk,
         keys::MoveTo::Trash => Role::Trash,
     })
 }
 
-fn junk_target(role: &Role) -> Role {
+fn spam_target(role: &Role) -> Role {
     match role {
         Role::Junk | Role::Trash | Role::Archive => Role::Inbox,
         _ => Role::Junk,
@@ -421,7 +421,7 @@ impl Session {
                 Some(keys::Goto::Drafts) => self.goto_role(Role::Drafts),
                 Some(keys::Goto::Sent) => self.goto_role(Role::Sent),
                 Some(keys::Goto::Archive) => self.goto_role(Role::Archive),
-                Some(keys::Goto::Junk) => self.goto_role(Role::Junk),
+                Some(keys::Goto::Spam) => self.goto_role(Role::Junk),
                 Some(keys::Goto::Trash) => self.goto_role(Role::Trash),
                 Some(keys::Goto::Next) => self.step(true),
                 Some(keys::Goto::Prev) => self.step(false),

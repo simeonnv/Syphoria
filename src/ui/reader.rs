@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::{
     Action, Attached, Attachments, Compose, Ctx, Draft, Load, Op, PAGE, View, attachments::size,
-    confirm_popup, date, emails, failure, junk_target, keys, keys_popup, move_target, status,
+    confirm_popup, date, emails, failure, keys, keys_popup, move_target, spam_target, status,
     theme, yank,
 };
 use crate::{
@@ -76,7 +76,7 @@ impl Reader {
             keys::Mail::Back => return Action::Pop,
             keys::Mail::Trash => self.move_to(ctx, Role::Trash),
             keys::Mail::Archive => self.move_to(ctx, Role::Archive),
-            keys::Mail::Junk => self.move_to(ctx, junk_target(&self.role)),
+            keys::Mail::Spam => self.move_to(ctx, spam_target(&self.role)),
             keys::Mail::Delete => self.pending = Some(Pending::Destroy),
             keys::Mail::Move => self.pending = Some(Pending::Move),
             keys::Mail::Unread => self.run(ctx, Op::Seen(false)),

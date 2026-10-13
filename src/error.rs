@@ -222,6 +222,12 @@ pub enum UiError {
     LoadAddresses,
     #[error("failed to add address")]
     AddAddress,
+    #[error("failed to count messages")]
+    CountMessages,
+    #[error("failed to load delivery rules")]
+    LoadDeliveries,
+    #[error("failed to update delivery")]
+    SetDelivery,
     #[error("you have no address yet, create one in Addresses")]
     NoAddress,
     #[error("sender is not on one of your domains")]
