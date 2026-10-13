@@ -5,6 +5,7 @@ use std::{
 
 use email_address::EmailAddress;
 use exn::{ErrorExt, ResultExt, ensure};
+use nucleo_matcher::{Config, Matcher};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -13,10 +14,11 @@ use ratatui::{
     widgets::{Clear, List, ListItem, ListState, Paragraph},
 };
 use ratatui_textarea::TextArea;
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     Action, Ctx, Load, Mode, View, attachments::size, cycle, failure, keys, line_input, list_nav,
-    pick, status, theme, yank,
+    pick, status, suggest, suggestions_popup, theme, yank,
 };
 use crate::{
     app::KeyEvent,
@@ -111,11 +113,16 @@ pub struct Compose {
     mode: Mode,
     sending: Load<()>,
     port: u16,
+    recipients: Load<Vec<String>>,
+    suggestions: Vec<String>,
+    choice: usize,
+    matcher: Matcher,
 }
 
 impl Compose {
     pub fn new(ctx: &Ctx, draft: Draft) -> Self {
         let (state, user) = (ctx.state, ctx.user);
+        let mail = ctx.mail.clone();
         let focus = if draft.to.is_empty() {
             Field::To
         } else {
@@ -142,7 +149,59 @@ impl Compose {
             mode: Mode::Normal,
             sending: Task::new(),
             port: state.server.listen.port(),
+            recipients: Task::new_spawn(async move {
+                let list = mail
+                    .recipients()
+                    .await
+                    .or_raise(|| UiError::LoadRecipients)?;
+                Ok(list.into_iter().filter(|a| !user.owns(a)).collect())
+            }),
+            suggestions: Vec::new(),
+            choice: 0,
+            matcher: Matcher::new(Config::DEFAULT),
         }
+    }
+
+    fn to_line(&self) -> String {
+        self.to.lines().join("")
+    }
+
+    fn suggest(&mut self) -> Vec<String> {
+        if self.focus != Field::To || self.mode != Mode::Insert {
+            return Vec::new();
+        }
+        let line = self.to_line();
+        if self.to.cursor().1 != line.chars().count() {
+            return Vec::new();
+        }
+        let (done, needle) = line.rsplit_once(',').unwrap_or(("", &line));
+        let needle = needle.trim();
+        let Task::Done(Ok(list)) = &self.recipients else {
+            return Vec::new();
+        };
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let entered: Vec<String> = done.split(',').map(|s| s.trim().to_lowercase()).collect();
+        let candidates = list
+            .iter()
+            .filter(|a| !entered.contains(a))
+            .cloned()
+            .collect();
+        suggest(&mut self.matcher, needle, candidates)
+    }
+
+    fn complete(&mut self) {
+        let Some(choice) = self.suggestions.get(self.choice) else {
+            return;
+        };
+        let line = self.to_line();
+        let text = match line.rsplit_once(',') {
+            Some((done, _)) => format!("{done}, {choice}, "),
+            None => format!("{choice}, "),
+        };
+        self.to = line_input(text);
+        self.choice = 0;
     }
 
     fn sender(&self) -> Option<&String> {
@@ -434,12 +493,26 @@ impl View for Compose {
             attachments,
         );
 
-        for (area, field, title, rect) in [
-            (&mut self.to, Field::To, " To ", to),
-            (&mut self.subject, Field::Subject, " Subject ", subject),
-            (&mut self.body, Field::Body, " Body ", body),
+        let mut to_block = block(" To ".into(), Field::To);
+        if let Task::Done(Err(e)) = self.recipients.poll() {
+            to_block = to_block.title_bottom(Line::from(format!(" {} ", failure(e))).red());
+        }
+        for (area, field, field_block, rect) in [
+            (&mut self.to, Field::To, to_block, to),
+            (
+                &mut self.subject,
+                Field::Subject,
+                block(" Subject ".into(), Field::Subject),
+                subject,
+            ),
+            (
+                &mut self.body,
+                Field::Body,
+                block(" Body ".into(), Field::Body),
+                body,
+            ),
         ] {
-            area.set_block(block(title.into(), field));
+            area.set_block(field_block);
             area.set_cursor_style(if field == focus && mode == Mode::Insert {
                 Style::new().reversed()
             } else {
@@ -447,6 +520,19 @@ impl View for Compose {
             });
             frame.render_widget(&**area, rect);
         }
+
+        self.suggestions = self.suggest();
+        self.choice = self.choice.min(self.suggestions.len().saturating_sub(1));
+        let line = self.to_line();
+        let last = line.rsplit(',').next().unwrap_or_default().trim_start();
+        let offset = (line.width() - last.width()) as u16;
+        suggestions_popup(
+            frame,
+            to.x + 1 + offset,
+            to.bottom(),
+            &self.suggestions,
+            self.choice,
+        );
 
         let line = match self.sending.poll() {
             Task::Unexecuted => Line::from(""),
@@ -463,6 +549,17 @@ impl View for Compose {
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
         if self.picker.is_some() {
             self.picker_input(key);
+            return Action::None;
+        }
+        if !self.suggestions.is_empty()
+            && let Some(cmd) = keys::Suggest::get(&key)
+        {
+            let len = self.suggestions.len();
+            match cmd {
+                keys::Suggest::Complete => self.complete(),
+                keys::Suggest::Next => self.choice = (self.choice + 1) % len,
+                keys::Suggest::Prev => self.choice = (self.choice + len - 1) % len,
+            }
             return Action::None;
         }
         match keys::Fields::get(&key) {
@@ -495,8 +592,10 @@ impl View for Compose {
                     self.focus = self.focus.step(true);
                 }
                 Some(keys::Insert::Next) | None => {
-                    if let Some(area) = self.field() {
-                        area.input(key);
+                    if let Some(area) = self.field()
+                        && area.input(key)
+                    {
+                        self.choice = 0;
                     }
                 }
             },
@@ -536,6 +635,9 @@ impl View for Compose {
                 &[keys::Files::KEYS, keys::Edit::KEYS, keys::Fields::KEYS]
             }
             (Mode::Normal, _, None) => &[keys::Edit::KEYS, keys::Fields::KEYS],
+            (Mode::Insert, _, None) if !self.suggestions.is_empty() => {
+                &[keys::Suggest::KEYS, keys::Insert::KEYS, keys::Fields::KEYS]
+            }
             (Mode::Insert, _, None) => &[keys::Insert::KEYS, keys::Fields::KEYS],
         }
     }

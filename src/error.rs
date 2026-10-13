@@ -206,6 +206,8 @@ pub enum UiError {
     Search,
     #[error("failed to load correspondents")]
     LoadCorrespondents,
+    #[error("failed to load recipients")]
+    LoadRecipients,
     #[error("failed to load message")]
     LoadMessage,
     #[error("failed to send message")]

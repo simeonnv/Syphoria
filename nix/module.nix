@@ -63,7 +63,7 @@
   };
 in {
   options.services.syphoria = {
-    enable = lib.mkEnableOption "syphoria, a mail and password vault served over SSH";
+    enable = lib.mkEnableOption "syphoria, a email multiplexer and password vault served over SSH";
 
     package = lib.mkOption {
       type = lib.types.package;

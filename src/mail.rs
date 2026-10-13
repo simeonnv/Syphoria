@@ -291,19 +291,38 @@ impl Mail {
     }
 
     pub async fn correspondents(&self) -> Result<Vec<String>, RemoteError> {
+        self.addresses(None, &[Property::From, Property::To, Property::Cc])
+            .await
+    }
+
+    pub async fn recipients(&self) -> Result<Vec<String>, RemoteError> {
+        self.addresses(
+            Some(&self.sent),
+            &[Property::To, Property::Cc, Property::Bcc],
+        )
+        .await
+    }
+
+    async fn addresses(
+        &self,
+        mailbox: Option<&str>,
+        properties: &[Property],
+    ) -> Result<Vec<String>, RemoteError> {
         let mut request = self.client.build();
         for position in (0..CORRESPONDENTS).step_by(GET_LIMIT) {
             let query = request.query_email();
+            if let Some(mailbox) = mailbox {
+                query.filter(Condition::in_mailbox(mailbox));
+            }
             query
                 .sort([email::query::Comparator::received_at().descending()])
                 .position(position as i32)
                 .limit(GET_LIMIT);
             let ids = query.result_reference();
-            request.get_email().ids_ref(ids).properties([
-                Property::From,
-                Property::To,
-                Property::Cc,
-            ]);
+            request
+                .get_email()
+                .ids_ref(ids)
+                .properties(properties.iter().cloned());
         }
 
         let responses = request
@@ -319,7 +338,7 @@ impl Mail {
                 .map_err(RemoteError::jmap)?
                 .take_list()
             {
-                for addr in [email.from(), email.to(), email.cc()]
+                for addr in [email.from(), email.to(), email.cc(), email.bcc()]
                     .into_iter()
                     .flatten()
                     .flatten()

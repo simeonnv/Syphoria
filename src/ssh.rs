@@ -421,7 +421,7 @@ impl SessionTask {
 async fn close(handle: &Handle, channel: ChannelId, message: Option<String>) {
     let bye = format!(
         "{LEAVE_ALT_SCREEN}{}\r\n",
-        message.as_deref().unwrap_or("bye")
+        message.as_deref().unwrap_or("bye!")
     );
     let _ = handle.data(channel, bye.into()).await;
     let _ = handle.exit_status_request(channel, 0).await;

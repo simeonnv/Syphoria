@@ -345,6 +345,11 @@ keymap! {
         Normal: Esc => "normal mode",
         Next: Enter => "next field",
     }
+    Suggest {
+        Complete: Tab => "complete",
+        Next: Down | Ctrl('n') => "next suggestion",
+        Prev: Up | Ctrl('p') => "previous suggestion",
+    }
     Password {
         Generate: Ctrl('r') => "generate password",
     }
@@ -398,4 +403,5 @@ const _: () = {
         Files::KEYS,
     ]);
     disjoint(&[Always::KEYS, Fields::KEYS, Insert::KEYS, Password::KEYS]);
+    disjoint(&[Always::KEYS, Suggest::KEYS, Insert::KEYS]);
 };

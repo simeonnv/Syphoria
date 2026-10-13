@@ -14,6 +14,10 @@ use chrono::{DateTime, Utc};
 use enum_dispatch::enum_dispatch;
 use exn::{Exn, ResultExt};
 use jmap_client::mailbox::Role;
+use nucleo_matcher::{
+    Matcher,
+    pattern::{CaseMatching, Normalization, Pattern},
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -23,6 +27,7 @@ use ratatui::{
 };
 use ratatui_textarea::{CursorMove, TextArea};
 use termwiz::input::Modifiers;
+use unicode_width::UnicodeWidthStr;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -47,6 +52,7 @@ type Load<T> = Task<exn::Result<T, UiError>>;
 const SIDEBAR_WIDTH: u16 = 28;
 const REFRESH_TICKS: u32 = 50;
 const PAGE: u16 = 20;
+const SUGGESTIONS: usize = 8;
 
 const COMMANDS: &[(&str, &str)] = &[
     (":q  :quit", "quit"),
@@ -781,6 +787,41 @@ fn lines_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'stat
     frame.render_widget(
         Paragraph::new(lines).block(theme::block().title(title.to_owned())),
         rect,
+    );
+}
+
+fn suggest(matcher: &mut Matcher, needle: &str, candidates: Vec<String>) -> Vec<String> {
+    Pattern::parse(needle, CaseMatching::Ignore, Normalization::Smart)
+        .match_list(candidates, matcher)
+        .into_iter()
+        .take(SUGGESTIONS)
+        .map(|(candidate, _)| candidate)
+        .collect()
+}
+
+fn suggestions_popup(frame: &mut Frame, x: u16, y: u16, suggestions: &[String], choice: usize) {
+    if suggestions.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let width =
+        (suggestions.iter().map(|s| s.width()).max().unwrap_or(0) as u16 + 4).min(area.width);
+    let height = suggestions.len() as u16 + 2;
+    let rect = Rect {
+        x: x.min(area.right().saturating_sub(width)),
+        y,
+        width,
+        height: height.min(area.bottom().saturating_sub(y)),
+    };
+    let items: Vec<ListItem> = suggestions.iter().cloned().map(ListItem::new).collect();
+    let mut state = ListState::default().with_selected(Some(choice));
+    frame.render_widget(Clear, rect);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(theme::block())
+            .highlight_style(theme::SELECTED),
+        rect,
+        &mut state,
     );
 }
 

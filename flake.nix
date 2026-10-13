@@ -41,8 +41,8 @@
         default = devenv.lib.mkShell {
           inherit inputs pkgs;
           modules = [
-            ./shell.nix
-            ./hooks.nix
+            ./nix/shell.nix
+            ./nix/hooks.nix
           ];
         };
       }

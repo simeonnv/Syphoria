@@ -14,14 +14,15 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::Line,
-    widgets::{Clear, List, ListItem, ListState, Row, Table, TableState},
+    widgets::{Row, Table, TableState},
 };
 use ratatui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
     Action, Ctx, Load, Mode, Op, Reader, View, confirm_popup, date, emails, failure, junk_target,
-    keys, keys_popup, line_input, move_target, names, table_nav, theme, yank,
+    keys, keys_popup, line_input, move_target, names, suggest, suggestions_popup, table_nav, theme,
+    yank,
 };
 use crate::{
     app::KeyEvent,
@@ -33,7 +34,6 @@ use crate::{
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const BATCH: usize = 100;
 const PRELOAD: usize = 10;
-const SUGGESTIONS: usize = 8;
 const HINT: &str = " me: with: from: to: subject: in: unread read ";
 
 enum Pending {
@@ -203,12 +203,7 @@ impl Search {
             "in" => self.folders.iter().flat_map(labels).collect(),
             _ => return Vec::new(),
         };
-        Pattern::parse(value, CaseMatching::Ignore, Normalization::Smart)
-            .match_list(candidates, &mut self.matcher)
-            .into_iter()
-            .take(SUGGESTIONS)
-            .map(|(candidate, _)| candidate)
-            .collect()
+        suggest(&mut self.matcher, value, candidates)
     }
 
     fn accept(&mut self, choice: &str) {
@@ -330,9 +325,6 @@ impl Search {
 
     fn draw_suggestions(&mut self, frame: &mut Frame, input: Rect) {
         let suggestions = self.suggestions();
-        if suggestions.is_empty() {
-            return;
-        }
         let line = self.line();
         let offset = split(&line)
             .1
@@ -341,25 +333,12 @@ impl Search {
                 Some(line.width() - pending.width() + key.len() + 1)
             })
             .unwrap_or(0) as u16;
-        let width = (suggestions.iter().map(|s| s.width()).max().unwrap_or(0) as u16 + 4)
-            .min(frame.area().width);
-        let height = suggestions.len() as u16 + 2;
-        let x = (input.x + offset).min(frame.area().right().saturating_sub(width));
-        let rect = Rect {
-            x,
-            y: input.bottom(),
-            width,
-            height: height.min(frame.area().bottom().saturating_sub(input.bottom())),
-        };
-        let items: Vec<ListItem> = suggestions.into_iter().map(ListItem::new).collect();
-        let mut state = ListState::default().with_selected(Some(self.choice));
-        frame.render_widget(Clear, rect);
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(theme::block())
-                .highlight_style(theme::SELECTED),
-            rect,
-            &mut state,
+        suggestions_popup(
+            frame,
+            input.x + offset,
+            input.bottom(),
+            &suggestions,
+            self.choice,
         );
     }
 }
