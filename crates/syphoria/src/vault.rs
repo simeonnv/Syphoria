@@ -8,15 +8,19 @@ use std::{
 };
 
 use exn::{Exn, IteratorExt, OptionExt, ResultExt, bail, ensure};
+use log::{info, warn};
+use rand::RngExt;
 use rusqlite::{Connection, ErrorCode, params};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     config::{Username, VaultConfig},
     error::StorageError,
-    stalwart::Address,
     state::User,
 };
+
+const GENERATED: usize = 24;
+const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?";
 
 const ATTEMPTS: u32 = 3;
 const LOCKOUT: Duration = Duration::from_secs(5 * 60);
@@ -131,11 +135,16 @@ impl Vault {
         let mut failures = self.failures();
         let failure = failures.entry(user.name.clone()).or_default();
         failure.count += 1;
+        warn!(
+            "wrong vault password for {} ({}/{ATTEMPTS})",
+            user.name, failure.count
+        );
         ensure!(failure.count >= ATTEMPTS, StorageError::WrongPassword);
         *failure = Failures {
             count: 0,
             locked_until: Some(Instant::now() + LOCKOUT),
         };
+        warn!("vault of {} locked for {LOCKOUT:?}", user.name);
         bail!(StorageError::Locked)
     }
 
@@ -190,7 +199,10 @@ impl Db {
             !account.service.trim().is_empty(),
             StorageError::EmptyService
         );
-        Address::new(self.user, &account.address).or_raise(|| StorageError::InvalidAddress)?;
+        ensure!(
+            account.address.is_empty() || self.user.owns(&account.address),
+            StorageError::InvalidAddress
+        );
 
         let conn = self.conn.clone();
         let saved = account.clone();
@@ -237,6 +249,27 @@ impl Db {
         .await?;
         Ok(())
     }
+
+    pub async fn rekey(&self, password: Zeroizing<String>) -> exn::Result<(), StorageError> {
+        let conn = self.conn.clone();
+        blocking(move || {
+            let conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
+            conn.pragma_update(None, "rekey", &*password)
+                .or_raise(|| StorageError::Rekey)
+        })
+        .await?;
+        info!("vault password changed for {}", self.user.name);
+        Ok(())
+    }
+}
+
+pub fn generate_password() -> Zeroizing<String> {
+    let mut rng = rand::rng();
+    let mut password = Zeroizing::new(String::with_capacity(256));
+    for _ in 0..GENERATED {
+        password.push(char::from(CHARSET[rng.random_range(0..CHARSET.len())]));
+    }
+    password
 }
 
 fn open(path: &Path, password: &str) -> exn::Result<Option<Connection>, StorageError> {

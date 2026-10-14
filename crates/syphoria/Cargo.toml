@@ -1,0 +1,46 @@
+[package]
+name = "syphoria"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+backon.workspace = true
+bytesize.workspace = true
+chrono.workspace = true
+clap.workspace = true
+email_address.workspace = true
+enum_dispatch.workspace = true
+env_logger.workspace = true
+exn.workspace = true
+fqdn.workspace = true
+futures.workspace = true
+hyper-util.workspace = true
+image.workspace = true
+jmap-client.workspace = true
+log.workspace = true
+mime_guess.workspace = true
+nucleo-matcher.workspace = true
+rand.workspace = true
+ratatui.workspace = true
+ratatui-image.workspace = true
+ratatui-textarea.workspace = true
+reqwest = { workspace = true, features = ["rustls", "http2", "json"] }
+rusqlite.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+sha2.workspace = true
+syphoria-api.workspace = true
+termwiz.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+toml.workspace = true
+unicode-width.workspace = true
+url.workspace = true
+zeroize.workspace = true

@@ -30,3 +30,6 @@ result-*
 .direnv
 .pre-commit-config.yaml
 .devenv
+
+# ---> syphoria
+crates/syphoria-extension/dist

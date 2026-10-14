@@ -30,6 +30,8 @@ pub enum ConfigError {
     Vault,
     #[error("failed to set up file storage")]
     Files,
+    #[error("failed to load tls certificate")]
+    Tls,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +52,8 @@ pub enum StorageError {
     Create,
     #[error("failed to open vault")]
     Open,
+    #[error("failed to re-encrypt vault")]
+    Rekey,
     #[error("vault query failed")]
     Query,
     #[error("vault task failed")]
@@ -170,8 +174,6 @@ pub enum InputError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
-    #[error("ssh server failed")]
-    Serve,
     #[error("ssh session failed")]
     Session,
     #[error("auth succeeded without a public key")]
@@ -262,6 +264,42 @@ pub enum UiError {
     PasswordMismatch,
     #[error("use at least {0} characters")]
     PasswordTooShort(usize),
+    #[error("failed to change vault password")]
+    ChangePassword,
+    #[error("failed to load tokens")]
+    LoadTokens,
+    #[error("failed to create token")]
+    CreateToken,
+    #[error("failed to revoke token")]
+    RevokeToken,
+    #[error("token name may not be empty")]
+    EmptyTokenName,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WebError {
+    #[error("invalid api token")]
+    Token,
+    #[error("vault locked, unlock again")]
+    Session,
+    #[error("failed to unlock vault")]
+    Unlock,
+    #[error("failed to load accounts")]
+    LoadAccounts,
+    #[error("account not found")]
+    NotFound,
+    #[error("failed to save account")]
+    SaveAccount,
+    #[error("failed to load addresses")]
+    LoadAddresses,
+    #[error("failed to create address")]
+    AddAddress,
+    #[error("`{0}` is not one of your addresses")]
+    UnknownAddress(String),
+    #[error("tls handshake failed")]
+    Handshake,
+    #[error("https connection failed")]
+    Connection,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -274,8 +312,10 @@ pub enum MainError {
     Provision,
     #[error("failed to load host key")]
     HostKey,
-    #[error("ssh server stopped")]
-    Serve,
+    #[error("failed to set up https api")]
+    Api,
+    #[error("failed to listen")]
+    Listen,
 }
 
 #[derive(Debug)]

@@ -1,14 +1,18 @@
+mod api;
 mod app;
 mod backend;
 mod config;
 mod error;
 mod files;
+mod listen;
 mod mail;
+mod sessions;
 mod sftp;
 mod ssh;
 mod stalwart;
 mod state;
 mod task;
+mod tokens;
 mod ui;
 mod vault;
 
@@ -16,15 +20,20 @@ use std::{path::PathBuf, time::Duration};
 
 use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
+use env_logger::Env;
 use exn::ResultExt;
+use log::{info, warn};
 
 use crate::{
+    api::Api,
     config::Config,
     error::{MainError, chain, is_temporary},
     ssh::SshServer,
     state::AppState,
     ui::Pages,
 };
+
+const LOG_DEFAULT: &str = "syphoria=info,warn";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -35,11 +44,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> exn::Result<(), MainError> {
+    env_logger::Builder::from_env(Env::default().default_filter_or(LOG_DEFAULT)).init();
     let args = Args::parse();
     let config = Config::load(&args.config).or_raise(|| MainError::LoadConfig)?;
     let state = AppState::new(config).or_raise(|| MainError::InvalidConfig)?;
 
-    println!(
+    info!(
         "loaded {}: {} domain(s), {} user(s), {} key(s)",
         args.config.display(),
         state.domains.len(),
@@ -60,7 +70,7 @@ async fn main() -> exn::Result<(), MainError> {
     )
     .when(|e| is_temporary(e.frame()))
     .notify(|e, delay| {
-        println!(
+        warn!(
             "stalwart unavailable, retrying in {delay:?}: {}",
             chain(e.frame())
         )
@@ -68,7 +78,7 @@ async fn main() -> exn::Result<(), MainError> {
     .await
     .or_raise(|| MainError::Provision)?;
 
-    println!("provisioned stalwart");
+    info!("provisioned stalwart");
 
     let host_key =
         ssh::load_or_create_host_key(&state.server.host_key).or_raise(|| MainError::HostKey)?;
@@ -78,9 +88,21 @@ async fn main() -> exn::Result<(), MainError> {
         refresh_rate: Some(Duration::from_millis(100)),
     };
 
-    println!("listening on {}", state.server.listen);
-    server
-        .run(ssh::config(host_key), state.server.listen)
-        .await
-        .or_raise(|| MainError::Serve)
+    let api = state
+        .api
+        .as_ref()
+        .map(|config| Api::new(state, config))
+        .transpose()
+        .or_raise(|| MainError::Api)?;
+
+    info!(
+        "listening on {}{}",
+        state.server.listen,
+        if api.is_some() {
+            " (ssh + https)"
+        } else {
+            " (ssh)"
+        }
+    );
+    listen::run(state.server.listen, server, ssh::config(host_key), api).await
 }

@@ -26,20 +26,23 @@
 - One Stalwart account per user; addresses are aliases on it; users may only use their own domains.
 - `src/ui/`: `Pages` root, `Page` enum via `enum_dispatch`, `View` trait, page stack.
 - Async work via `Task` (spawn, poll in render). Never block in render/input.
+- Workspace: `crates/syphoria` (server), `crates/syphoria-api` (shared types, `site()` via psl), `crates/syphoria-extension` (browser extension).
+- One port: `src/listen.rs` peeks the first byte; `0x16` (TLS) goes to the HTTPS API (`src/api.rs`, axum + rustls), everything else to SSH. API only if `[api]` is set.
+- API auth: token from the TUI (vault → `t`), stored hashed in plain sqlite `vault/<user>.tokens`, format `user.secret`. `/api/unlock` with token + vault password opens a session (`src/sessions.rs`, in memory, 24h idle). Revoking a token drops its sessions.
+- Status codes: 401 = session gone (extension re-locks), 403 = bad token/password, 429 = vault lockout.
+- Vault accounts may have an empty address (logins captured by the extension).
+- Extension: all UI in the toolbar popup (dioxus 0.7, web, no `document` feature, CSP-safe). No in-page UI (clashes with other managers; Firefox blocks localhost requests from extension iframes in public pages).
+  - `content.js` (plain JS, Chrome blocks wasm in content scripts): detects login/signup forms, captures submits, fills on request.
+  - `background.js`: per-tab form/capture state in `storage.session`, badge (`+` signup, `!` unsaved login), `action.openPopup()` once per page, routes fill to the form's frame, holds the session id (`storage.session` is not exposed everywhere). Only extension pages get session/context/fill.
+  - Uses the `chrome` namespace (works in Firefox MV3 too).
+- `wasm-bindgen` crate is pinned (`=0.2.129`) to `nix/wasm-bindgen-cli.nix`; bump both together.
 
 ## Errors
 
-- All error types live in `src/error.rs`, by situation.
-- Each error has only the fields it needs. Kinds are per type and say what the caller can do.
-  - `StorageError { kind: StorageKind, message }`, temporary when `Locked`.
-  - `RemoteError { kind: RemoteKind, status, message }`, `status` = `Temporary` if a retry may help.
-  - Message only: `ConfigError`, `InputError` (validation), `SshError`, `UiError`, `MainError`. `HandlerError` wraps `Exn<SshError>` for russh.
-- Return `exn::Result<T, E>`. Cross situations with `or_raise(|| ...)` / `ok_or_raise`; new errors via `bail!`/`ensure!`/`.raise()`. Never flatten into strings.
-- Same situation: plain `?`, or `or_raise` to add context. jmap errors: `RemoteError::jmap`.
-- Context names what failed at that call; callers add the rest. One context per call, no shared `let err = || ...` closures.
-- Never drop errors (`let _ =`, `.ok()`, `map_err(|_| ..)`, `Err(_) =>`). Propagate; if cleanup also fails keep both as children (`IteratorExt::raise`). Exception: non-fatal teardown (closing channels).
-- Machines: outer frames' kind may not match the cause, so walk the tree (`is_temporary`). Top-frame `kind` only where the error is raised (e.g. `AlreadyExists` in `Stalwart::create`).
-- Humans: `{e:?}` prints the tree (logs, main); UI shows one line via `ui::failure` (`chain` + retry hint).
+- `exn` + plain `thiserror` enums, one per situation, all in `src/error.rs`.
+- Return `exn::Result<T, E>`. Use `or_raise(|| Variant)` to wrap, `bail!`/`ensure!` for new errors. Never flatten into strings.
+- Never drop errors (`let _ =`, `.ok()`, `Err(_) =>`), except non-fatal teardown.
+- Walk the tree for decisions (`is_temporary`). Logs print `{e:?}`, UI shows one line via `ui::failure`.
 
 ## Dev
 
@@ -60,3 +63,6 @@
 - Dev Stalwart: `session.auth.require = false`, SPF/DKIM/DMARC off, extra keys in `config.local-keys`.
 - `pkill -f <pattern>` kills your own shell if the command contains the pattern.
 - Start processes only after files they need are written.
+- rusqlite `chrono` stores datetimes as TEXT; STRICT tables need TEXT columns.
+- `nix build .#…` only sees git-tracked files; new files need `git add` (ask first).
+- Stock nixpkgs Firefox requires signed add-ons; the unsigned XPI works on Developer Edition / LibreWolf (`xpinstall.signatures.required = false`) or after AMO signing.

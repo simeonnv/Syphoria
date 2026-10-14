@@ -322,8 +322,24 @@ keymap! {
         Delete: Char('d') => "delete",
         YankPassword: Char('y') => "yank password",
         YankUsername: Char('Y') => "yank username",
+        Tokens: Char('t') => "api tokens",
+        Password: Char('p') => "change vault password",
         Reload: Char('r') => "reload",
         Back: Esc => "back",
+    }
+    Tokens {
+        Add: Char('a') => "new token",
+        Revoke: Char('d') => "revoke",
+        Reload: Char('r') => "reload",
+        Back: Esc => "back",
+    }
+    NewToken {
+        Create: Enter => "create",
+        Cancel: Esc => "cancel",
+    }
+    ShowToken {
+        Yank: Char('y') => "yank token",
+        Close: Esc | Enter => "close",
     }
     Account {
         Edit: Char('e') => "edit",
@@ -399,6 +415,9 @@ const _: () = {
     disjoint(&[Always::KEYS, NewAddress::KEYS]);
     disjoint(&[Always::KEYS, Unlock::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Vault::KEYS]);
+    disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Tokens::KEYS]);
+    disjoint(&[Always::KEYS, NewToken::KEYS]);
+    disjoint(&[Always::KEYS, Global::KEYS, ShowToken::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Account::KEYS]);
     disjoint(&[
         Always::KEYS,

@@ -1,13 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::ErrorKind,
     net::SocketAddr,
     path::Path,
     sync::Arc,
     time::Duration,
 };
 
-use exn::{OptionExt, ResultExt};
+use exn::{Frame, OptionExt, ResultExt};
+use log::{debug, error, info, warn};
 use ratatui::Terminal;
 use russh::{
     Channel, ChannelId, MethodKind, MethodSet, Pty,
@@ -15,10 +17,10 @@ use russh::{
         Algorithm, HashAlg, PrivateKey, PublicKey,
         ssh_key::{LineEnding, rand_core::OsRng},
     },
-    server::{Auth, Config, Handle, Handler, Msg, Server, Session},
+    server::{Auth, Config, Handle, Handler, Msg, Server, Session, run_stream},
 };
 use termwiz::input::{InputEvent, InputParser, KeyCode, KeyEvent, Modifiers};
-use tokio::sync::mpsc;
+use tokio::{net::TcpStream, sync::mpsc};
 
 use crate::{
     app::App,
@@ -33,6 +35,7 @@ pub type AppFactory = fn(AppState, &'static User) -> Box<dyn App>;
 const ENTER_ALT_SCREEN: &str = "\x1b[?1049h\x1b[H\x1b[?25l";
 const LEAVE_ALT_SCREEN: &str = "\x1b[?1049l\x1b[?25h\x1b[0m";
 
+#[derive(Clone, Copy)]
 pub struct SshServer {
     pub state: AppState,
     pub factory: AppFactory,
@@ -67,18 +70,26 @@ pub fn load_or_create_host_key(path: &Path) -> exn::Result<PrivateKey, StorageEr
     key.write_openssh_file(path, LineEnding::LF)
         .or_raise(|| StorageError::CreateHostKey)?;
 
-    println!("generated new host key at {}", path.display());
+    info!("generated new host key at {}", path.display());
 
     Ok(key)
 }
 
 impl SshServer {
-    pub async fn run(self, config: Config, addr: SocketAddr) -> exn::Result<(), SshError> {
-        let mut server = self;
-        server
-            .run_on_address(Arc::new(config), addr)
-            .await
-            .or_raise(|| SshError::Serve)
+    pub async fn serve(mut self, config: Arc<Config>, stream: TcpStream, peer: SocketAddr) {
+        if config.nodelay
+            && let Err(e) = stream.set_nodelay(true)
+        {
+            warn!("set_nodelay failed for {peer}: {e}");
+        }
+        let handler = self.new_client(Some(peer));
+        let result = match run_stream(config, stream, handler).await {
+            Ok(session) => session.await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            self.handle_session_error(e);
+        }
     }
 }
 
@@ -86,7 +97,11 @@ impl Server for SshServer {
     type Handler = SessionHandler;
 
     fn handle_session_error(&mut self, error: HandlerError) {
-        eprintln!("session error: {:?}", error.0);
+        if is_disconnect(error.0.frame()) {
+            debug!("session closed: {:?}", error.0);
+        } else {
+            warn!("session error: {:?}", error.0);
+        }
     }
 
     fn new_client(&mut self, peer: Option<SocketAddr>) -> SessionHandler {
@@ -139,7 +154,7 @@ impl SessionHandler {
         let user = self.state.user_by_key(key);
 
         if user.is_none() {
-            println!(
+            warn!(
                 "rejected key from {}: {} {}",
                 self.peer(),
                 key.fingerprint(HashAlg::Sha256),
@@ -194,7 +209,7 @@ impl Handler for SessionHandler {
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), HandlerError> {
         let user = self.user.ok_or_raise(|| SshError::NoPublicKey)?;
 
-        println!("connected: {} from {}", user.name, self.peer());
+        info!("connected: {} from {}", user.name, self.peer());
         Ok(())
     }
 
@@ -220,7 +235,7 @@ impl Handler for SessionHandler {
                     .channel_success(channel)
                     .or_raise(|| SshError::Subsystem)?;
                 self.sftp.insert(channel);
-                println!("sftp: {} from {}", user.name, self.peer());
+                info!("sftp: {} from {}", user.name, self.peer());
                 russh_sftp::server::run(stream.into_stream(), Sftp::new(self.state, user)).await;
             }
             _ => session
@@ -339,7 +354,7 @@ impl Handler for SessionHandler {
 impl Drop for SessionHandler {
     fn drop(&mut self) {
         if let Some(user) = self.user {
-            println!("disconnected: {} from {}", user.name, self.peer());
+            info!("disconnected: {} from {}", user.name, self.peer());
         }
     }
 }
@@ -361,7 +376,7 @@ impl SessionTask {
         });
 
         if let Err(e) = self.render().await {
-            eprintln!("render error: {e:?}");
+            error!("render error: {e:?}");
             return;
         }
 
@@ -394,7 +409,7 @@ impl SessionTask {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("render error: {e:?}");
+                    error!("render error: {e:?}");
                     close(&self.handle, self.channel, Some("internal error".into())).await;
                     return;
                 }
@@ -427,4 +442,22 @@ async fn close(handle: &Handle, channel: ChannelId, message: Option<String>) {
     let _ = handle.exit_status_request(channel, 0).await;
     let _ = handle.eof(channel).await;
     let _ = handle.close(channel).await;
+}
+
+fn is_disconnect(frame: &Frame) -> bool {
+    let disconnect = match frame.error().downcast_ref::<russh::Error>() {
+        Some(russh::Error::IO(e)) => matches!(
+            e.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+        ),
+        Some(
+            russh::Error::Disconnect
+            | russh::Error::HUP
+            | russh::Error::ConnectionTimeout
+            | russh::Error::KeepaliveTimeout
+            | russh::Error::InactivityTimeout,
+        ) => true,
+        _ => false,
+    };
+    disconnect || frame.children().iter().any(is_disconnect)
 }

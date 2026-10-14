@@ -7,6 +7,7 @@ mod messages;
 mod reader;
 mod search;
 mod theme;
+mod tokens;
 
 use std::{cell::Cell, error::Error, sync::Arc, time::Instant};
 
@@ -39,13 +40,14 @@ use crate::{
     vault::Db,
 };
 
-use accounts::{AccountForm, AccountView, Accounts};
+use accounts::{AccountForm, AccountView, Accounts, Rekey};
 use addresses::Addresses;
 use attachments::{Attachments, Preview};
 use compose::{Attached, Compose, Draft};
 use messages::Messages;
 use reader::Reader;
 use search::Search;
+use tokens::Tokens;
 
 type Load<T> = Task<exn::Result<T, UiError>>;
 
@@ -167,6 +169,8 @@ pub enum Page {
     Search,
     Attachments,
     Preview,
+    Tokens,
+    Rekey,
 }
 
 #[derive(Clone, PartialEq, Eq)]

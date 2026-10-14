@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, fmt, fs, str::FromStr};
 use email_address::EmailAddress;
 use exn::{ResultExt, ensure};
 use fqdn::FQDN;
+use log::{info, warn};
 use reqwest::Method;
 use serde::{Deserialize, de::DeserializeOwned, de::IgnoredAny};
 use serde_json::{Value, json};
@@ -109,7 +110,7 @@ impl Stalwart {
 
             for address in self.addresses(user).await? {
                 if !user.owns(&address) {
-                    println!("removing {address} from {}: no longer assigned", user.name);
+                    info!("removing {address} from {}: no longer assigned", user.name);
                     self.edit_emails(&user.name, "removeItem", &address).await?;
                 }
             }
@@ -131,9 +132,9 @@ impl Stalwart {
                     .edit_emails(&user.name, "addItem", address.as_str())
                     .await
                 {
-                    Ok(()) => println!("assigned {address} to {}", user.name),
+                    Ok(()) => info!("assigned {address} to {}", user.name),
                     Err(e) if matches!(*e, RemoteError::AlreadyExists) => {
-                        println!(
+                        warn!(
                             "not assigning {address} to {}: claimed by another account",
                             user.name
                         );

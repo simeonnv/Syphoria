@@ -8,10 +8,12 @@ use fqdn::FQDN;
 use russh::keys::{HashAlg, PublicKey, ssh_key::public::KeyData};
 
 use crate::{
-    config::{Config, Email, ServerConfig, Username},
+    config::{ApiConfig, Config, Email, ServerConfig, Username},
     error::ConfigError,
     files::Files,
+    sessions::Sessions,
     stalwart::Stalwart,
+    tokens::Tokens,
     vault::Vault,
 };
 
@@ -51,8 +53,11 @@ impl User {
 #[derive(Debug)]
 pub struct AppStateInner {
     pub server: ServerConfig,
+    pub api: Option<ApiConfig>,
     pub stalwart: Stalwart,
     pub vault: Vault,
+    pub tokens: Tokens,
+    pub sessions: Sessions,
     pub files: Files,
     pub domains: BTreeSet<FQDN>,
     pub users: BTreeMap<Username, User>,
@@ -78,6 +83,7 @@ impl AppState {
             stalwart,
             vault,
             files,
+            api,
             users: user_configs,
         } = config;
 
@@ -134,8 +140,11 @@ impl AppState {
 
         let inner = AppStateInner {
             server,
+            api,
             stalwart: Stalwart::new(stalwart)?,
+            tokens: Tokens::new(vault.dir.clone()),
             vault: Vault::new(vault).or_raise(|| ConfigError::Vault)?,
+            sessions: Sessions::default(),
             files: Files::new(files).or_raise(|| ConfigError::Files)?,
             domains,
             users,
@@ -150,6 +159,10 @@ impl AppState {
             .keys
             .get(key.key_data())
             .and_then(|name| inner.users.get(name))
+    }
+
+    pub fn user(self, name: &Username) -> Option<&'static User> {
+        self.0.users.get(name)
     }
 
     pub fn key_count(self) -> usize {

@@ -22,6 +22,18 @@
 
   services = ["syphoria.service"] ++ lib.optional stalwartLocal "stalwart.service";
 
+  credentials = "/run/credentials/syphoria.service";
+  acmeHost = cfg.api.useACMEHost;
+  acmeDir = config.security.acme.certs.${acmeHost}.directory;
+  tlsCert =
+    if acmeHost != null
+    then "${acmeDir}/fullchain.pem"
+    else cfg.api.certFile;
+  tlsKey =
+    if acmeHost != null
+    then "${acmeDir}/key.pem"
+    else cfg.api.keyFile;
+
   backupScript = pkgs.writeShellApplication {
     name = "syphoria-backup";
     runtimeInputs = with pkgs; [
@@ -61,6 +73,109 @@
         | xargs -r -I{} rm -- "$dir/{}"
     '';
   };
+
+  stalwartDir = config.services.stalwart.dataDir;
+
+  restoreScript = pkgs.writeShellApplication {
+    name = "syphoria-restore";
+    runtimeInputs = with pkgs; [
+      coreutils
+      findutils
+      gnutar
+      zstd
+      systemd
+    ];
+    text = ''
+      dir=${lib.escapeShellArg cfg.backup.dir}
+      yes=0
+      if [ "''${1:-}" = "-y" ]; then
+        yes=1
+        shift
+      fi
+      archive=''${1:-}
+      if [ -z "$archive" ]; then
+        echo "usage: syphoria-restore [-y] <archive.tar.zst|latest>" >&2
+        exit 2
+      fi
+      if [ "$(id -u)" != 0 ]; then
+        echo "run as root" >&2
+        exit 1
+      fi
+      if [ "$archive" = latest ]; then
+        archive=$(find "$dir" -maxdepth 1 -name 'syphoria-*.tar.zst' | sort -r | head -n 1)
+      fi
+      if [ ! -f "$archive" ]; then
+        echo "no such backup: ''${archive:-none in $dir}" >&2
+        exit 1
+      fi
+
+      staging=$(mktemp -d "$dir/.restore.XXXXXX")
+      current=""
+      safety=""
+      restored=0
+      stopped=0
+      cleanup() {
+        rm -rf "$staging"
+        if [ -n "$current" ]; then rm -rf "$current"; fi
+        if [ "$stopped" = 1 ] && [ "$restored" = 0 ]; then
+          echo "restore failed, services are stopped. previous state: ''${safety:-not saved}" >&2
+        fi
+      }
+      trap cleanup EXIT
+
+      tar -C "$staging" --zstd -xf "$archive"
+      if [ ! -d "$staging/syphoria" ]; then
+        echo "$archive is not a syphoria backup" >&2
+        exit 1
+      fi
+      ${lib.optionalString stalwartLocal ''
+        if [ ! -d "$staging/stalwart" ]; then
+          echo "warning: $archive has no stalwart data, only syphoria state is restored" >&2
+        fi
+      ''}
+
+      if [ "$yes" != 1 ]; then
+        echo "restoring $archive replaces the current data (a copy is kept)"
+        read -r -p "continue? [y/N] " answer
+        if [ "$answer" != y ] && [ "$answer" != Y ]; then
+          exit 1
+        fi
+      fi
+
+      stamp=$(date -u +%Y%m%dT%H%M%SZ)
+      systemctl stop ${lib.concatStringsSep " " services}
+      stopped=1
+
+      current=$(mktemp -d "$dir/.current.XXXXXX")
+      mkdir -p ${stateDir}
+      cp -a --reflink=auto ${stateDir}/. "$current/syphoria"
+      ${lib.optionalString stalwartLocal ''
+        if [ -d ${stalwartDir} ]; then
+          cp -a --reflink=auto ${stalwartDir}/. "$current/stalwart"
+        fi
+      ''}
+      tar -C "$current" --zstd -cf "$dir/.pre-restore-$stamp.tar.zst" .
+      mv "$dir/.pre-restore-$stamp.tar.zst" "$dir/pre-restore-$stamp.tar.zst"
+      safety="$dir/pre-restore-$stamp.tar.zst"
+
+      owner=$(stat -c %u:%g ${stateDir}/)
+      find -H ${stateDir}/ -mindepth 1 -delete
+      cp -a "$staging/syphoria/." ${stateDir}/
+      chown -R "$owner" ${stateDir}/
+      ${lib.optionalString stalwartLocal ''
+        if [ -d "$staging/stalwart" ]; then
+          mkdir -p ${stalwartDir}
+          find -H ${stalwartDir}/ -mindepth 1 -delete
+          cp -a "$staging/stalwart/." ${stalwartDir}/
+          chown -R ${config.services.stalwart.user}:${config.services.stalwart.group} ${stalwartDir}/
+        fi
+      ''}
+
+      systemctl start ${lib.concatStringsSep " " services}
+      restored=1
+      echo "restored $archive, previous state saved to $safety"
+    '';
+  };
 in {
   options.services.syphoria = {
     enable = lib.mkEnableOption "syphoria, a email multiplexer and password vault served over SSH";
@@ -75,7 +190,33 @@ in {
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open the SSH port from {option}`services.syphoria.settings.server.listen`.";
+      description = "Open the SSH (and HTTPS API) port from {option}`services.syphoria.settings.server.listen`.";
+    };
+
+    api = {
+      enable = lib.mkEnableOption ''
+        the HTTPS API used by the browser extension. It shares the SSH port:
+        TLS connections are served as HTTPS, everything else as SSH
+      '';
+
+      useACMEHost = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "mail.example.com";
+        description = "Use the certificate of this {option}`security.acme.certs` entry. Restarts syphoria on renewal.";
+      };
+
+      certFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "PEM certificate chain, if {option}`useACMEHost` is not set.";
+      };
+
+      keyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "PEM private key, if {option}`useACMEHost` is not set. Not copied to the store.";
+      };
     };
 
     settings = lib.mkOption {
@@ -286,8 +427,37 @@ in {
         };
       })
 
+      (lib.mkIf cfg.api.enable {
+        assertions = [
+          {
+            assertion = (acmeHost != null) != (cfg.api.certFile != null && cfg.api.keyFile != null);
+            message = "services.syphoria.api: set either useACMEHost or both certFile and keyFile";
+          }
+        ];
+
+        services.syphoria.settings.api = {
+          cert = "${credentials}/tls-cert";
+          key = "${credentials}/tls-key";
+        };
+
+        systemd.services.syphoria = {
+          wants = lib.optional (acmeHost != null) "acme-${acmeHost}.service";
+          after = lib.optional (acmeHost != null) "acme-${acmeHost}.service";
+          serviceConfig.LoadCredential = [
+            "tls-cert:${toString tlsCert}"
+            "tls-key:${toString tlsKey}"
+          ];
+        };
+
+        security.acme.certs = lib.mkIf (acmeHost != null) {
+          ${acmeHost}.reloadServices = ["syphoria.service"];
+        };
+      })
+
       (lib.mkIf cfg.backup.enable {
         systemd.tmpfiles.rules = ["d '${cfg.backup.dir}' 0700 root root - -"];
+
+        environment.systemPackages = [backupScript restoreScript];
 
         systemd.services.syphoria-backup = {
           description = "syphoria backup";

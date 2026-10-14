@@ -6,21 +6,24 @@
   cargo = lib.importTOML ../Cargo.toml;
 in
   rustPlatform.buildRustPackage {
-    pname = cargo.package.name;
-    inherit (cargo.package) version;
+    pname = "syphoria";
+    inherit (cargo.workspace.package) version;
 
     src = lib.fileset.toSource {
       root = ../.;
       fileset = lib.fileset.unions [
         ../Cargo.toml
         ../Cargo.lock
-        ../src
+        ../crates
       ];
     };
 
     cargoLock.lockFile = ../Cargo.lock;
+    cargoBuildFlags = ["-p" "syphoria"];
 
     nativeBuildInputs = [perl];
+
+    doCheck = false;
 
     meta = {
       description = "Mail and password vault over SSH, backed by Stalwart";

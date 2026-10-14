@@ -1,7 +1,6 @@
 use std::mem;
 
 use exn::{ErrorExt, Exn, ResultExt};
-use rand::RngExt;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -13,7 +12,7 @@ use ratatui_textarea::TextArea;
 use zeroize::Zeroizing;
 
 use super::{
-    Action, Ctx, Load, Mode, View, confirm_popup, contains, cycle, failure, find_match,
+    Action, Ctx, Load, Mode, Tokens, View, confirm_popup, contains, cycle, failure, find_match,
     keys::{self, Key},
     line_input, pick, status, table_nav, theme, yank,
 };
@@ -21,12 +20,10 @@ use crate::{
     app::KeyEvent,
     error::UiError,
     task::Task,
-    vault::{Account, Db},
+    vault::{Account, Db, generate_password},
 };
 
 const MIN_PASSWORD: usize = 8;
-const GENERATED: usize = 24;
-const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?";
 
 struct Secret(Zeroizing<String>);
 
@@ -42,14 +39,7 @@ impl Secret {
     }
 
     fn generate() -> Self {
-        let mut rng = rand::rng();
-        let mut secret = Self::new();
-        for _ in 0..GENERATED {
-            secret
-                .0
-                .push(char::from(CHARSET[rng.random_range(0..CHARSET.len())]));
-        }
-        secret
+        Self(generate_password())
     }
 
     fn input(&mut self, key: &KeyEvent) {
@@ -141,45 +131,25 @@ impl View for Accounts {
                     (true, false) => "choose a vault password",
                     (true, true) => "confirm vault password",
                 };
-                let mut lines = vec![
-                    Line::from(label).bold(),
-                    Line::from(vec![
-                        Span::raw("•".repeat(password.0.chars().count())),
-                        Span::raw(" ").reversed(),
-                    ]),
-                    Line::from(""),
-                ];
+                let mut footer = Vec::new();
                 match (attempt.poll(), error) {
-                    (Task::Running(_), _) => lines.push(Line::from("checking…").fg(theme::SUBTLE)),
-                    (_, Some(error)) => lines.push(Line::from(failure(error)).red()),
+                    (Task::Running(_), _) => {
+                        footer.push(Line::from("checking\u{2026}").fg(theme::SUBTLE));
+                    }
+                    (_, Some(error)) => footer.push(Line::from(failure(error)).red()),
                     _ => {}
                 }
                 if *setup {
-                    lines.push(
+                    footer.push(
                         Line::from("a forgotten password cannot be recovered").fg(theme::SUBTLE),
                     );
                 }
-
-                let width = 56.min(area.width);
-                let height = 8.min(area.height);
-                let rect = Rect {
-                    x: area.x + (area.width - width) / 2,
-                    y: area.y + (area.height - height) / 2,
-                    width,
-                    height,
-                };
                 let title = if *setup {
                     " create vault "
                 } else {
                     " vault locked "
                 };
-                frame.render_widget(Clear, rect);
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .wrap(Wrap { trim: false })
-                        .block(Block::bordered().title(title).green()),
-                    rect,
-                );
+                password_box(frame, area, title, label, password, footer);
             }
             State::Unlocked {
                 list,
@@ -306,6 +276,12 @@ impl View for Accounts {
                 match (cmd, selected(list, table)) {
                     (keys::Vault::Back, _) => return Action::Pop,
                     (keys::Vault::Reload, _) => *list = load(db),
+                    (keys::Vault::Tokens, _) => {
+                        return Action::Push(Box::new(Tokens::new(ctx).into()));
+                    }
+                    (keys::Vault::Password, _) => {
+                        return Action::Push(Box::new(Rekey::new(db.clone()).into()));
+                    }
                     (keys::Vault::Add, _) => {
                         return Action::Push(Box::new(
                             AccountForm::new(ctx, db.clone(), None).into(),
@@ -400,6 +376,180 @@ impl View for Accounts {
         if found.is_some() {
             table.select(found);
         }
+    }
+}
+
+fn password_box(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    label: &str,
+    secret: &Secret,
+    footer: Vec<Line<'static>>,
+) {
+    let mut lines = vec![
+        Line::from(label.to_owned()).bold(),
+        Line::from(vec![
+            Span::raw("\u{2022}".repeat(secret.0.chars().count())),
+            Span::raw(" ").reversed(),
+        ]),
+        Line::from(""),
+    ];
+    lines.extend(footer);
+    let width = 56.min(area.width);
+    let height = (lines.len() as u16 + 2).max(8).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(title.to_owned()).green()),
+        rect,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Current,
+    New,
+    Confirm,
+}
+
+pub struct Rekey {
+    db: Db,
+    step: Step,
+    input: Secret,
+    current: Option<Zeroizing<String>>,
+    new: Option<Zeroizing<String>>,
+    task: Load<()>,
+    error: Option<Exn<UiError>>,
+}
+
+impl Rekey {
+    fn new(db: Db) -> Self {
+        Self {
+            db,
+            step: Step::Current,
+            input: Secret::new(),
+            current: None,
+            new: None,
+            task: Task::new(),
+            error: None,
+        }
+    }
+
+    fn restart(&mut self, error: Exn<UiError>) {
+        self.step = Step::Current;
+        self.current = None;
+        self.new = None;
+        self.error = Some(error);
+    }
+
+    fn submit(&mut self, ctx: &Ctx) {
+        self.error = None;
+        let typed = self.input.take();
+        match self.step {
+            Step::Current => {
+                self.current = Some(typed);
+                self.step = Step::New;
+            }
+            Step::New if typed.chars().count() < MIN_PASSWORD => {
+                self.error = Some(UiError::PasswordTooShort(MIN_PASSWORD).raise());
+            }
+            Step::New => {
+                self.new = Some(typed);
+                self.step = Step::Confirm;
+            }
+            Step::Confirm if self.new.as_ref() != Some(&typed) => {
+                self.restart(UiError::PasswordMismatch.raise());
+            }
+            Step::Confirm => {
+                let (state, user) = (ctx.state, ctx.user);
+                let current = self.current.take().unwrap_or_default();
+                let db = self.db.clone();
+                self.task.spawn(async move {
+                    state
+                        .vault
+                        .unlock(user, current)
+                        .await
+                        .or_raise(|| UiError::ChangePassword)?;
+                    db.rekey(typed).await.or_raise(|| UiError::ChangePassword)?;
+                    state.sessions.close_user(user);
+                    Ok(())
+                });
+            }
+        }
+    }
+}
+
+impl View for Rekey {
+    fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(theme::block().title(" Accounts "), area);
+        let label = match self.step {
+            Step::Current => "current vault password",
+            Step::New => "new vault password",
+            Step::Confirm => "confirm new vault password",
+        };
+        let mut footer = Vec::new();
+        match (self.task.poll(), &self.error) {
+            (Task::Running(_), _) => {
+                footer.push(Line::from("re-encrypting\u{2026}").fg(theme::SUBTLE));
+            }
+            (Task::Done(Ok(())), _) => {
+                footer.push(Line::from("vault password changed").green());
+            }
+            (_, Some(error)) => footer.push(Line::from(failure(error)).red()),
+            _ => {}
+        }
+        footer.push(Line::from("browser extensions will have to unlock again").fg(theme::SUBTLE));
+        password_box(
+            frame,
+            area,
+            " change vault password ",
+            label,
+            &self.input,
+            footer,
+        );
+    }
+
+    fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
+        match self.task {
+            Task::Running(_) => return Action::None,
+            Task::Done(Ok(())) => return Action::Pop,
+            _ => {}
+        }
+        match keys::Unlock::get(&key) {
+            Some(keys::Unlock::Back) => return Action::Pop,
+            Some(keys::Unlock::Clear) => self.input = Secret::new(),
+            Some(keys::Unlock::Submit) => self.submit(ctx),
+            None => self.input.input(&key),
+        }
+        Action::None
+    }
+
+    fn help(&self) -> keys::Help {
+        &[keys::Unlock::KEYS]
+    }
+
+    fn mode(&self) -> Mode {
+        Mode::Insert
+    }
+
+    fn update(&mut self, _ctx: &Ctx) -> Action {
+        if !matches!(self.task.poll(), Task::Done(Err(_)) | Task::Panicked(_)) {
+            return Action::None;
+        }
+        match mem::take(&mut self.task) {
+            Task::Done(Err(e)) => self.restart(e),
+            Task::Panicked(e) => self.restart(Exn::new(e).raise(UiError::VaultPanicked)),
+            Task::Unexecuted | Task::Running(_) | Task::Done(Ok(())) => {}
+        }
+        Action::None
     }
 }
 
@@ -519,13 +669,15 @@ impl AccountForm {
             db,
             id: account.id,
             addresses: Task::new_spawn(async move {
-                state
+                let mut list = state
                     .stalwart
                     .addresses(user)
                     .await
-                    .or_raise(|| UiError::LoadAddresses)
+                    .or_raise(|| UiError::LoadAddresses)?;
+                list.push(String::new());
+                Ok(list)
             }),
-            address: (!account.address.is_empty()).then(|| account.address.clone()),
+            address: account.id.map(|_| account.address.clone()),
             service: line_input(account.service.clone()),
             username,
             password: match account.id {
@@ -627,11 +779,10 @@ impl View for AccountForm {
         };
 
         let sender = match self.addresses.poll() {
-            Task::Done(Ok(list)) if list.is_empty() => Line::from("no addresses yet").red(),
-            Task::Done(Ok(_)) => Line::from(format!(
-                "‹ {} ›",
-                self.address().map(String::as_str).unwrap_or_default()
-            )),
+            Task::Done(Ok(_)) => match self.address().map(String::as_str) {
+                Some("") | None => Line::from("‹ none ›").fg(theme::SUBTLE),
+                Some(address) => Line::from(format!("‹ {address} ›")),
+            },
             Task::Done(Err(e)) => Line::from(failure(e)).red(),
             _ => Line::from("loading…").fg(theme::SUBTLE),
         };

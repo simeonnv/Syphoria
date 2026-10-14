@@ -25,6 +25,8 @@ pub struct Config {
     pub stalwart: StalwartConfig,
     pub vault: VaultConfig,
     pub files: FilesConfig,
+    #[serde(default)]
+    pub api: Option<ApiConfig>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub users: BTreeMap<Username, UserConfig>,
@@ -49,6 +51,13 @@ pub struct StalwartConfig {
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     pub dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,12 +173,21 @@ impl Config {
         let mut config: Config = toml::from_str(&text).or_raise(|| ConfigError::Parse)?;
 
         if let Some(dir) = path.parent() {
+            let api = config
+                .api
+                .as_mut()
+                .map(|api| [&mut api.cert, &mut api.key])
+                .into_iter()
+                .flatten();
             for file in [
                 &mut config.server.host_key,
                 &mut config.stalwart.admin_password_file,
                 &mut config.vault.dir,
                 &mut config.files.dir,
-            ] {
+            ]
+            .into_iter()
+            .chain(api)
+            {
                 if file.is_relative() {
                     *file = dir.join(&*file);
                 }

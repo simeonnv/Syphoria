@@ -1,0 +1,25 @@
+[package]
+name = "syphoria-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+console_log.workspace = true
+dioxus.workspace = true
+exn.workspace = true
+js-sys.workspace = true
+log.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde-wasm-bindgen.workspace = true
+syphoria-api.workspace = true
+thiserror.workspace = true
+url.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-extensions-sys.workspace = true
+web-sys.workspace = true
