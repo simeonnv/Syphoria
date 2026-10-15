@@ -1,30 +1,112 @@
-use std::{io, mem};
+use std::{
+    collections::{HashMap, HashSet},
+    io, mem,
+};
 
 use ratatui::{
     backend::{Backend, ClearType, WindowSize},
-    buffer::Cell,
+    buffer::{Buffer, Cell},
     layout::{Position, Rect, Size},
     style::{Color, Modifier},
 };
-use termwiz::escape::osc::{OperatingSystemCommand, Selection};
+use termwiz::{
+    escape::osc::{OperatingSystemCommand, Selection},
+    hyperlink::Hyperlink,
+};
 use unicode_width::UnicodeWidthStr;
 use zeroize::{Zeroize, Zeroizing};
+
+const UNLINK: &str = "\x1b]8;;\x1b\\";
+
+pub struct Link {
+    pub url: String,
+    pub cells: Vec<Position>,
+}
 
 pub struct SshBackend {
     size: Rect,
     buf: Vec<u8>,
+    screen: Buffer,
+    hrefs: Vec<String>,
+    links: HashMap<Position, usize>,
 }
 
 impl SshBackend {
     pub fn new(cols: u16, rows: u16) -> Self {
+        let size = Rect::new(0, 0, cols, rows);
         Self {
-            size: Rect::new(0, 0, cols, rows),
+            size,
             buf: Vec::new(),
+            screen: Buffer::empty(size),
+            hrefs: Vec::new(),
+            links: HashMap::new(),
         }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.size = Rect::new(0, 0, cols, rows);
+        self.screen = Buffer::empty(self.size);
+    }
+
+    pub fn set_links(&mut self, links: Vec<Link>) {
+        let mut hrefs = Vec::new();
+        let mut cells = HashMap::new();
+        for (i, link) in links.into_iter().enumerate() {
+            let href = Hyperlink::new_with_id(link.url, i.to_string());
+            hrefs.push(OperatingSystemCommand::SetHyperlink(Some(href)).to_string());
+            cells.extend(link.cells.into_iter().map(|p| (p, i)));
+        }
+        let changed: HashSet<Position> = self
+            .links
+            .keys()
+            .chain(cells.keys())
+            .filter(|p| href(&self.hrefs, &self.links, p) != href(&hrefs, &cells, p))
+            .copied()
+            .collect();
+        self.hrefs = hrefs;
+        self.links = cells;
+        if changed.is_empty() {
+            return;
+        }
+        let cells = changed
+            .into_iter()
+            .filter_map(|p| self.screen.cell(p).map(|c| (p.x, p.y, c.clone())))
+            .collect();
+        self.write(b"\x1b7");
+        self.paint(cells);
+        self.write(b"\x1b8");
+    }
+
+    fn paint(&mut self, mut cells: Vec<(u16, u16, Cell)>) {
+        cells.sort_by_key(|(x, y, _)| (*y, *x));
+
+        let mut cursor: Option<(u16, u16)> = None;
+        let mut open: Option<usize> = None;
+        for (x, y, cell) in cells {
+            let link = self.links.get(&Position::new(x, y)).copied();
+            if link != open {
+                let osc = link.map_or(UNLINK, |i| &self.hrefs[i]);
+                self.buf.extend_from_slice(osc.as_bytes());
+                open = link;
+            }
+            if cursor != Some((x, y)) {
+                self.write(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
+            }
+            let symbol = cell.symbol();
+            let style = format!(
+                "\x1b[0m{}{}{}",
+                fg(cell.fg),
+                bg(cell.bg),
+                modifiers(cell.modifier)
+            );
+            self.write(style.as_bytes());
+            self.write(symbol.as_bytes());
+            cursor = Some((x + symbol.width() as u16, y));
+        }
+        if open.is_some() {
+            self.write(UNLINK.as_bytes());
+        }
+        self.write(b"\x1b[0m");
     }
 
     pub fn take(&mut self) -> Vec<u8> {
@@ -43,6 +125,14 @@ impl SshBackend {
     fn write(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
     }
+}
+
+fn href<'a>(
+    hrefs: &'a [String],
+    links: &HashMap<Position, usize>,
+    p: &Position,
+) -> Option<&'a str> {
+    links.get(p).map(|&i| hrefs[i].as_str())
 }
 
 fn fg(color: Color) -> String {
@@ -126,26 +216,13 @@ impl Backend for SshBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        let mut cells: Vec<_> = content.collect();
-        cells.sort_by_key(|(x, y, _)| (*y, *x));
-
-        let mut cursor: Option<(u16, u16)> = None;
-        for (x, y, cell) in cells {
-            if cursor != Some((x, y)) {
-                self.write(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
+        let cells: Vec<_> = content.map(|(x, y, c)| (x, y, c.clone())).collect();
+        for (x, y, cell) in &cells {
+            if let Some(shown) = self.screen.cell_mut((*x, *y)) {
+                *shown = cell.clone();
             }
-            let symbol = cell.symbol();
-            let style = format!(
-                "\x1b[0m{}{}{}",
-                fg(cell.fg),
-                bg(cell.bg),
-                modifiers(cell.modifier)
-            );
-            self.write(style.as_bytes());
-            self.write(symbol.as_bytes());
-            cursor = Some((x + symbol.width() as u16, y));
         }
-        self.write(b"\x1b[0m");
+        self.paint(cells);
         Ok(())
     }
 
@@ -170,11 +247,15 @@ impl Backend for SshBackend {
     }
 
     fn clear(&mut self) -> io::Result<()> {
+        self.screen.reset();
         self.write(b"\x1b[2J\x1b[H");
         Ok(())
     }
 
     fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        if clear_type == ClearType::All {
+            self.screen.reset();
+        }
         self.write(match clear_type {
             ClearType::All => b"\x1b[2J".as_slice(),
             ClearType::AfterCursor => b"\x1b[J",

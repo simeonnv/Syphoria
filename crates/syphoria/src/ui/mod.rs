@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     app::{App, InputEvent, KeyCode, KeyEvent, SshTerminal},
+    backend::Link,
     error::{UiError, chain, is_temporary},
     mail::{Addr, Folder, Mail},
     state::{AppState, User},
@@ -154,6 +155,9 @@ pub trait View {
     fn search(&mut self, _query: &str, _forward: bool) {}
     fn command(&mut self, _name: &str, _ctx: &Ctx) -> Option<Action> {
         None
+    }
+    fn links(&mut self) -> Vec<Link> {
+        Vec::new()
     }
 }
 
@@ -653,6 +657,14 @@ impl Session {
             self.draw_help(frame, body);
         }
     }
+
+    fn links(&mut self) -> Vec<Link> {
+        let links = self.stack.last_mut().map(View::links).unwrap_or_default();
+        if self.help || self.pending.is_some() {
+            return Vec::new();
+        }
+        links
+    }
 }
 
 pub struct Pages {
@@ -697,9 +709,14 @@ impl App for Pages {
         match &mut self.session {
             Some(session) => {
                 session.update();
+                let mut links = Vec::new();
                 terminal
-                    .draw(|frame| session.draw(frame))
+                    .draw(|frame| {
+                        session.draw(frame);
+                        links = session.links();
+                    })
                     .or_raise(|| UiError::Draw)?;
+                terminal.backend_mut().set_links(links);
                 if let Some(text) = session.clipboard.take() {
                     terminal.backend_mut().clipboard(&text);
                 }

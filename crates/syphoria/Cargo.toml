@@ -19,6 +19,7 @@ futures.workspace = true
 hyper-util.workspace = true
 image.workspace = true
 jmap-client.workspace = true
+linkify.workspace = true
 log.workspace = true
 mime_guess.workspace = true
 nucleo-matcher.workspace = true

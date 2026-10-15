@@ -281,6 +281,11 @@ keymap! {
         Forward: Char('f') => "forward",
         Attachments: Char('o') => "attachments",
         YankBody: Alt('y') => "yank body",
+        Links: Char('l') => "links",
+    }
+    Links {
+        Yank: Enter => "yank link",
+        Close: Esc => "close",
     }
     Attachments {
         Open: Enter => "preview",
@@ -410,6 +415,7 @@ const _: () = {
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Attachments::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Preview::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Picker::KEYS]);
+    disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Links::KEYS]);
     disjoint(&[Always::KEYS, SearchInput::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Addresses::KEYS]);
     disjoint(&[Always::KEYS, NewAddress::KEYS]);

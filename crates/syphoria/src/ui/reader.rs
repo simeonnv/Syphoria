@@ -1,24 +1,36 @@
+use std::mem;
+
 use exn::ResultExt;
 use jmap_client::mailbox::Role;
+use linkify::{LinkFinder, LinkKind};
 use ratatui::{
     Frame,
-    layout::Rect,
+    buffer::Buffer,
+    layout::{Position, Rect},
     style::Stylize,
     text::{Line, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::{Clear, List, ListState, Paragraph, Widget, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
+use url::Url;
 
 use super::{
     Action, Attached, Attachments, Compose, Ctx, Draft, Load, Op, PAGE, View, attachments::size,
-    confirm_popup, date, emails, failure, keys, keys_popup, move_target, spam_target, status,
-    theme, yank,
+    confirm_popup, date, emails, failure, keys, keys_popup, list_nav, move_target, spam_target,
+    status, theme, yank,
 };
 use crate::{
     app::KeyEvent,
+    backend::Link,
     error::UiError,
     mail::{Addr, Message},
     task::Task,
 };
+
+struct Href {
+    text: String,
+    url: String,
+}
 
 enum Pending {
     Move,
@@ -32,6 +44,8 @@ pub struct Reader {
     scroll: u16,
     op: Load<()>,
     pending: Option<Pending>,
+    menu: Option<ListState>,
+    links: Vec<Link>,
 }
 
 impl Reader {
@@ -49,6 +63,8 @@ impl Reader {
             scroll: 0,
             op: Task::new(),
             pending: None,
+            menu: None,
+            links: Vec::new(),
         }
     }
 
@@ -90,6 +106,29 @@ impl Reader {
                     return yank(&message.subject);
                 }
             }
+        }
+        Action::None
+    }
+
+    fn menu_input(&mut self, key: &KeyEvent) -> Action {
+        let Some(menu) = &mut self.menu else {
+            return Action::None;
+        };
+        if list_nav(menu, key) {
+            return Action::None;
+        }
+        match keys::Links::get(key) {
+            Some(keys::Links::Yank) => {
+                let selected = menu.selected();
+                self.menu = None;
+                if let (Task::Done(Ok(message)), Some(i)) = (&self.message, selected)
+                    && let Some(href) = hrefs(&message.body).get(i)
+                {
+                    return yank(&href.text);
+                }
+            }
+            Some(keys::Links::Close) => self.menu = None,
+            None => {}
         }
         Action::None
     }
@@ -148,19 +187,42 @@ impl View for Reader {
         }
         text.extend(message.body.lines().map(Line::from));
 
-        frame.render_widget(
-            Paragraph::new(text)
-                .block(block.title(format!(" {} ", message.subject)))
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0)),
-            area,
-        );
-
-        match self.pending {
-            Some(Pending::Move) => keys_popup(frame, area, " move to ", &[keys::MoveTo::KEYS]),
-            Some(Pending::Destroy) => confirm_popup(frame, area, " delete permanently? "),
-            None => {}
+        let hrefs = hrefs(&message.body);
+        let block = block.title(format!(" {} ", message.subject));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let longest = hrefs.iter().map(|h| h.text.width()).max().unwrap_or(0);
+        let span = (longest / usize::from(inner.width.max(1))) as u16 + 1;
+        let start = self.scroll.saturating_sub(span);
+        let skip = self.scroll - start;
+        let rect = Rect::new(0, 0, inner.width, inner.height.saturating_add(skip + span));
+        let mut rendered = Buffer::empty(rect);
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((start, 0))
+            .render(rect, &mut rendered);
+        let buf = frame.buffer_mut();
+        for y in 0..inner.height {
+            for x in 0..inner.width {
+                buf[(inner.x + x, inner.y + y)] = rendered[(x, y + skip)].clone();
+            }
         }
+
+        self.links = match (&self.pending, &mut self.menu) {
+            (Some(Pending::Move), _) => {
+                keys_popup(frame, area, " move to ", &[keys::MoveTo::KEYS]);
+                Vec::new()
+            }
+            (Some(Pending::Destroy), _) => {
+                confirm_popup(frame, area, " delete permanently? ");
+                Vec::new()
+            }
+            (None, Some(menu)) => {
+                draw_menu(frame, area, &hrefs, menu);
+                Vec::new()
+            }
+            (None, None) => locate(&rendered, &hrefs, skip, inner),
+        };
     }
 
     fn input(&mut self, key: KeyEvent, ctx: &Ctx) -> Action {
@@ -178,6 +240,9 @@ impl View for Reader {
                 }
             }
             return Action::None;
+        }
+        if self.menu.is_some() {
+            return self.menu_input(&key);
         }
 
         if let Some(nav) = keys::Nav::get(&key) {
@@ -211,12 +276,23 @@ impl View for Reader {
                 Box::new(Attachments::new(ctx, message.attachments.clone()).into()),
             ),
             Some(keys::Reader::YankBody) => yank(&message.body),
+            Some(keys::Reader::Links) => {
+                self.menu = Some(ListState::default().with_selected(Some(0)));
+                Action::None
+            }
             Some(keys::Reader::Attachments) | None => Action::None,
         }
     }
 
     fn help(&self) -> keys::Help {
-        &[keys::Reader::KEYS, keys::Mail::KEYS]
+        match self.menu {
+            Some(_) => &[keys::Links::KEYS],
+            None => &[keys::Reader::KEYS, keys::Mail::KEYS],
+        }
+    }
+
+    fn links(&mut self) -> Vec<Link> {
+        mem::take(&mut self.links)
     }
 
     fn update(&mut self, _ctx: &Ctx) -> Action {
@@ -225,6 +301,85 @@ impl View for Reader {
             _ => Action::None,
         }
     }
+}
+
+fn hrefs(body: &str) -> Vec<Href> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    let mut hrefs: Vec<Href> = Vec::new();
+    for link in finder.links(body) {
+        let text = link.as_str();
+        if let Ok(url) = Url::parse(text)
+            && matches!(url.scheme(), "http" | "https")
+            && !hrefs.iter().any(|h| h.text == text)
+        {
+            hrefs.push(Href {
+                text: text.to_owned(),
+                url: url.into(),
+            });
+        }
+    }
+    hrefs
+}
+
+fn locate(rendered: &Buffer, hrefs: &[Href], skip: u16, inner: Rect) -> Vec<Link> {
+    let area = rendered.area;
+    let mut text = String::new();
+    let mut cells = Vec::new();
+    for y in 0..area.height {
+        let row: Vec<_> = (0..area.width)
+            .map(|x| (x, rendered[(x, y)].symbol()))
+            .collect();
+        let end = row
+            .iter()
+            .rposition(|(_, s)| *s != " ")
+            .map_or(0, |i| i + 1);
+        for &(x, symbol) in &row[..end] {
+            cells.push((text.len(), Position::new(x, y)));
+            text.push_str(symbol);
+        }
+    }
+    hrefs
+        .iter()
+        .map(|href| Link {
+            url: href.url.clone(),
+            cells: text
+                .match_indices(&href.text)
+                .flat_map(|(at, found)| {
+                    let from = cells.partition_point(|(b, _)| *b < at);
+                    let to = cells.partition_point(|(b, _)| *b < at + found.len());
+                    &cells[from..to]
+                })
+                .filter(|(_, p)| p.y >= skip && p.y - skip < inner.height)
+                .map(|(_, p)| Position::new(inner.x + p.x, inner.y + p.y - skip))
+                .collect(),
+        })
+        .filter(|link| !link.cells.is_empty())
+        .collect()
+}
+
+fn draw_menu(frame: &mut Frame, area: Rect, hrefs: &[Href], menu: &mut ListState) {
+    let width = area.width.saturating_sub(4);
+    let height = (hrefs.len().max(1) as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let block = theme::block().title(" links ");
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    if hrefs.is_empty() {
+        frame.render_widget(Line::from("no links").fg(theme::SUBTLE), inner);
+        return;
+    }
+    frame.render_stateful_widget(
+        List::new(hrefs.iter().map(|h| h.text.as_str())).highlight_style(theme::SELECTED),
+        inner,
+        menu,
+    );
 }
 
 fn list(addrs: &[Addr]) -> String {
