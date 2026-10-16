@@ -12,8 +12,8 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 
 use super::{
-    Action, Ctx, Load, Mode, View, contains, failure, find_match, keys, keys_popup, line_input,
-    status, table_nav, theme, yank,
+    Action, Ctx, ForwardForm, Load, Mode, View, contains, failure, find_match, keys, keys_popup,
+    line_input, status, table_nav, theme, yank,
 };
 use crate::{
     app::KeyEvent,
@@ -242,6 +242,12 @@ impl View for Addresses {
                             local: line_input(random_local_part()),
                             domain: 0,
                         };
+                    }
+                    Some(keys::Addresses::Forward) => {
+                        if let Some(address) = self.selected().cloned() {
+                            let form = ForwardForm::new(ctx, Some(address));
+                            return Action::Push(Box::new(form.into()));
+                        }
                     }
                     Some(keys::Addresses::Yank) => {
                         if let Some(address) = self.selected() {

@@ -170,6 +170,12 @@ pub enum InputError {
     UnknownFolder(String),
     #[error("invalid file name `{0}`")]
     InvalidFileName(String),
+    #[error("not one of your addresses")]
+    ForeignAddress,
+    #[error("cannot forward to your own addresses")]
+    OwnForward,
+    #[error("filter text must be one line of 1-{0} characters")]
+    InvalidFilter(usize),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,6 +236,12 @@ pub enum UiError {
     LoadDeliveries,
     #[error("failed to update delivery")]
     SetDelivery,
+    #[error("failed to load forwards")]
+    LoadForwards,
+    #[error("failed to add forward")]
+    AddForward,
+    #[error("failed to remove forward")]
+    RemoveForward,
     #[error("you have no address yet, create one in Addresses")]
     NoAddress,
     #[error("sender is not on one of your domains")]

@@ -4,7 +4,8 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use exn::{OptionExt, Result, ResultExt};
+use email_address::Options;
+use exn::{OptionExt, Result, ResultExt, ensure};
 use jmap_client::{
     client::Client,
     core::{query, response::EmailSetResponse, set::SetObject},
@@ -12,9 +13,13 @@ use jmap_client::{
     mailbox::{self, Role},
     sieve,
 };
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::error::RemoteError;
+use crate::{
+    error::{InputError, RemoteError},
+    state::User,
+};
 
 const SEEN: &str = "$seen";
 const SPAM: &str = "$junk";
@@ -24,6 +29,8 @@ const GET_LIMIT: usize = 500;
 const CORRESPONDENTS: usize = 1000;
 const SCRIPT: &str = "syphoria";
 const RULE: &str = "if envelope :is \"to\" \"";
+const FORWARD: &str = "# forward ";
+const FILTER_MAX: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Delivery {
@@ -31,6 +38,161 @@ pub enum Delivery {
     Active,
     Spam,
     Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Header {
+    From,
+    Subject,
+}
+
+impl fmt::Display for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Header::From => "from",
+            Header::Subject => "subject",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Contains {
+    pub header: Header,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forward {
+    address: Option<String>,
+    filter: Option<Contains>,
+    target: String,
+    keep: bool,
+}
+
+impl Forward {
+    pub fn new(
+        user: &User,
+        address: Option<String>,
+        filter: Option<(Header, String)>,
+        target: &str,
+        keep: bool,
+    ) -> Result<Self, InputError> {
+        if let Some(address) = &address {
+            ensure!(user.owns(address), InputError::ForeignAddress);
+        }
+        let filter = match filter {
+            Some((header, text)) => {
+                let text = text.trim().to_owned();
+                ensure!(
+                    (1..=FILTER_MAX).contains(&text.chars().count())
+                        && !text.chars().any(char::is_control),
+                    InputError::InvalidFilter(FILTER_MAX)
+                );
+                Some(Contains { header, text })
+            }
+            None => None,
+        };
+        let options = Options::default()
+            .without_display_text()
+            .without_domain_literal()
+            .with_required_tld();
+        let target = email_address::EmailAddress::parse_with_options(target.trim(), options)
+            .or_raise(|| InputError::InvalidAddress)?;
+        ensure!(!user.owns(target.as_str()), InputError::OwnForward);
+        Ok(Self {
+            address,
+            filter,
+            target: target.as_str().to_owned(),
+            keep,
+        })
+    }
+
+    pub fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    pub fn filter(&self) -> Option<&Contains> {
+        self.filter.as_ref()
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn keep(&self) -> bool {
+        self.keep
+    }
+
+    fn sieve(&self) -> String {
+        let mut tests = vec!["not header :matches \"X-Spam-Score\" \"spam*\"".to_owned()];
+        if let Some(address) = &self.address {
+            tests.push(format!("envelope :is \"to\" {}", quote(address)));
+        }
+        if let Some(filter) = &self.filter {
+            tests.push(format!(
+                "header :contains {} {}",
+                quote(&filter.header.to_string()),
+                quote(&filter.text)
+            ));
+        }
+        let action = if self.keep {
+            format!("redirect :copy {};", quote(&self.target))
+        } else {
+            format!("redirect {}; discard; stop;", quote(&self.target))
+        };
+        format!("allof({}) {{ {action} }}", tests.join(", "))
+    }
+}
+
+#[derive(Default)]
+struct Rules {
+    deliveries: BTreeMap<String, Delivery>,
+    forwards: Vec<Forward>,
+}
+
+impl Rules {
+    fn parse(script: &str) -> Result<Self, RemoteError> {
+        let mut rules = Self::default();
+        for line in script.lines() {
+            if let Some(json) = line.strip_prefix(FORWARD) {
+                let forward = serde_json::from_str(json).or_raise(|| RemoteError::Internal)?;
+                rules.forwards.push(forward);
+            } else if let Some((address, delivery)) = delivery(line) {
+                rules.deliveries.insert(address, delivery);
+            }
+        }
+        Ok(rules)
+    }
+
+    fn script(&self, spam: &str) -> Result<String, RemoteError> {
+        let mut text = String::from(
+            "require [\"envelope\", \"fileinto\", \"mailbox\", \"mailboxid\", \"copy\"];\n",
+        );
+        for (address, delivery) in &self.deliveries {
+            if *delivery == Delivery::Blocked {
+                text.push_str(&format!("{RULE}{address}\" {{ discard; stop; }}\n"));
+            }
+        }
+        for forward in &self.forwards {
+            let json = serde_json::to_string(forward).or_raise(|| RemoteError::Internal)?;
+            text.push_str(&format!("{FORWARD}{json}\n"));
+        }
+        for (i, forward) in self.forwards.iter().enumerate() {
+            let keyword = if i == 0 { "if" } else { "elsif" };
+            text.push_str(&format!("{keyword} {}\n", forward.sieve()));
+        }
+        for (address, delivery) in &self.deliveries {
+            if *delivery == Delivery::Spam {
+                text.push_str(&format!(
+                    "{RULE}{address}\" {{ fileinto :mailboxid \"{spam}\" \"INBOX\"; stop; }}\n"
+                ));
+            }
+        }
+        Ok(text)
+    }
 }
 
 type Filter = query::Filter<Condition>;
@@ -410,11 +572,7 @@ impl Mail {
     }
 
     pub async fn deliveries(&self) -> Result<BTreeMap<String, Delivery>, RemoteError> {
-        Ok(self
-            .script()
-            .await?
-            .map(|(_, text)| rules(&text))
-            .unwrap_or_default())
+        Ok(self.rules().await?.1.deliveries)
     }
 
     pub async fn set_delivery(
@@ -422,18 +580,49 @@ impl Mail {
         address: &str,
         delivery: Delivery,
     ) -> Result<BTreeMap<String, Delivery>, RemoteError> {
-        let existing = self.script().await?;
-        let mut rules = existing
-            .as_ref()
-            .map(|(_, text)| rules(text))
-            .unwrap_or_default();
+        let (id, mut rules) = self.rules().await?;
         match delivery {
-            Delivery::Active => rules.remove(address),
-            other => rules.insert(address.to_owned(), other),
+            Delivery::Active => rules.deliveries.remove(address),
+            other => rules.deliveries.insert(address.to_owned(), other),
         };
-        let text = script(&rules, &self.spam);
-        match existing {
-            Some((id, _)) => {
+        self.store(id, &rules).await?;
+        Ok(rules.deliveries)
+    }
+
+    pub async fn forwards(&self) -> Result<Vec<Forward>, RemoteError> {
+        Ok(self.rules().await?.1.forwards)
+    }
+
+    pub async fn add_forward(&self, forward: Forward) -> Result<Vec<Forward>, RemoteError> {
+        let (id, mut rules) = self.rules().await?;
+        if !rules.forwards.contains(&forward) {
+            rules.forwards.push(forward);
+            rules
+                .forwards
+                .sort_by_key(|f| (f.address.is_none(), f.filter.is_none()));
+            self.store(id, &rules).await?;
+        }
+        Ok(rules.forwards)
+    }
+
+    pub async fn remove_forward(&self, forward: &Forward) -> Result<Vec<Forward>, RemoteError> {
+        let (id, mut rules) = self.rules().await?;
+        rules.forwards.retain(|f| f != forward);
+        self.store(id, &rules).await?;
+        Ok(rules.forwards)
+    }
+
+    async fn rules(&self) -> Result<(Option<String>, Rules), RemoteError> {
+        match self.script().await? {
+            Some((id, text)) => Ok((Some(id), Rules::parse(&text)?)),
+            None => Ok((None, Rules::default())),
+        }
+    }
+
+    async fn store(&self, id: Option<String>, rules: &Rules) -> Result<(), RemoteError> {
+        let text = rules.script(&self.spam)?;
+        match id {
+            Some(id) => {
                 self.client
                     .sieve_script_replace(&id, text, true)
                     .await
@@ -446,7 +635,7 @@ impl Mail {
                     .map_err(RemoteError::jmap)?;
             }
         }
-        Ok(rules)
+        Ok(())
     }
 
     async fn script(&self) -> Result<Option<(String, String)>, RemoteError> {
@@ -663,35 +852,20 @@ fn addrs(list: Option<&[EmailAddress]>) -> Vec<Addr> {
         .collect()
 }
 
-fn rules(script: &str) -> BTreeMap<String, Delivery> {
-    script
-        .lines()
-        .filter_map(|line| {
-            let (address, action) = line.strip_prefix(RULE)?.split_once('"')?;
-            let delivery = if action.contains("discard") {
-                Delivery::Blocked
-            } else if action.contains("fileinto") {
-                Delivery::Spam
-            } else {
-                return None;
-            };
-            Some((address.to_owned(), delivery))
-        })
-        .collect()
+fn delivery(line: &str) -> Option<(String, Delivery)> {
+    let (address, action) = line.strip_prefix(RULE)?.split_once('"')?;
+    let delivery = if action.contains("discard") {
+        Delivery::Blocked
+    } else if action.contains("fileinto") {
+        Delivery::Spam
+    } else {
+        return None;
+    };
+    Some((address.to_owned(), delivery))
 }
 
-fn script(rules: &BTreeMap<String, Delivery>, spam: &str) -> String {
-    let mut text =
-        String::from("require [\"envelope\", \"fileinto\", \"mailbox\", \"mailboxid\"];\n");
-    for (address, delivery) in rules {
-        let action = match delivery {
-            Delivery::Active => continue,
-            Delivery::Spam => format!("fileinto :mailboxid \"{spam}\" \"INBOX\""),
-            Delivery::Blocked => "discard".to_owned(),
-        };
-        text.push_str(&format!("{RULE}{address}\" {{ {action}; stop; }}\n"));
-    }
-    text
+fn quote(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn rank(role: &Role) -> u8 {

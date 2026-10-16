@@ -2,6 +2,7 @@ mod accounts;
 mod addresses;
 mod attachments;
 mod compose;
+mod forwards;
 mod keys;
 mod messages;
 mod reader;
@@ -45,6 +46,7 @@ use accounts::{AccountForm, AccountView, Accounts, Rekey};
 use addresses::Addresses;
 use attachments::{Attachments, Preview};
 use compose::{Attached, Compose, Draft};
+use forwards::{ForwardForm, Forwards};
 use messages::Messages;
 use reader::Reader;
 use search::Search;
@@ -167,6 +169,8 @@ pub enum Page {
     Reader,
     Compose,
     Addresses,
+    Forwards,
+    ForwardForm,
     Accounts,
     AccountView,
     AccountForm,
@@ -186,6 +190,7 @@ enum Nav {
     },
     Compose,
     Addresses,
+    Forwards,
     Accounts,
 }
 
@@ -197,6 +202,7 @@ impl Nav {
             }
             Nav::Compose => Compose::new(ctx, Draft::default()).into(),
             Nav::Addresses => Addresses::new(ctx).into(),
+            Nav::Forwards => Forwards::new(ctx).into(),
             Nav::Accounts => Accounts::new(ctx).into(),
         }
     }
@@ -279,7 +285,7 @@ impl Session {
                 name: f.name.clone(),
                 role: f.role.clone(),
             })
-            .chain([Nav::Compose, Nav::Addresses, Nav::Accounts])
+            .chain([Nav::Compose, Nav::Addresses, Nav::Forwards, Nav::Accounts])
             .collect()
     }
 
@@ -438,6 +444,7 @@ impl Session {
             Prefix::Space => match keys::Space::get(&key) {
                 Some(keys::Space::Compose) => self.go(Nav::Compose),
                 Some(keys::Space::Addresses) => self.go(Nav::Addresses),
+                Some(keys::Space::Forwards) => self.go(Nav::Forwards),
                 Some(keys::Space::Vault) => self.go(Nav::Accounts),
                 Some(keys::Space::Lock) => self.lock(),
                 Some(keys::Space::Help) => self.help = true,
@@ -542,6 +549,7 @@ impl Session {
                 divider,
                 ListItem::new("Compose"),
                 ListItem::new("Addresses"),
+                ListItem::new("Forwards"),
                 ListItem::new(accounts),
             ])
             .collect();

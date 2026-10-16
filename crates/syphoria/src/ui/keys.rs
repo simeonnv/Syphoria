@@ -217,6 +217,7 @@ keymap! {
     Space {
         Compose: Char('c') => "compose",
         Addresses: Char('a') => "addresses",
+        Forwards: Char('f') => "forwards",
         Vault: Char('v') => "vault",
         Lock: Char('l') => "lock vault",
         Help: Char('?') => "keymap",
@@ -299,6 +300,7 @@ keymap! {
     Addresses {
         Add: Char('a') => "add",
         Delivery: Char('d') => "delivery",
+        Forward: Char('f') => "forward",
         Yank: Char('y') => "yank",
         Reload: Char('r') => "reload",
         Back: Esc => "back",
@@ -307,6 +309,12 @@ keymap! {
         Active: Char('a') => "inbox",
         Spam: Char('j') => "spam",
         Blocked: Char('b') => "block (discard)",
+    }
+    Forwards {
+        Add: Char('a') => "add",
+        Delete: Char('d') => "delete",
+        Reload: Char('r') => "reload",
+        Back: Esc => "back",
     }
     NewAddress {
         Create: Enter => "create",
@@ -419,6 +427,7 @@ const _: () = {
     disjoint(&[Always::KEYS, SearchInput::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Addresses::KEYS]);
     disjoint(&[Always::KEYS, NewAddress::KEYS]);
+    disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Forwards::KEYS]);
     disjoint(&[Always::KEYS, Unlock::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Vault::KEYS]);
     disjoint(&[Always::KEYS, Global::KEYS, Nav::KEYS, Tokens::KEYS]);
